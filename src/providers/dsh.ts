@@ -22,6 +22,13 @@ import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderC
 const zstdDecompress = (zlib as { zstdDecompressSync?: (buf: Buffer) => Buffer }).zstdDecompressSync
 
 const ZSTD_MAGIC = 0xfd2fb528
+let warnedZstdUnavailable = false
+
+function warnZstdUnavailable(): void {
+  if (warnedZstdUnavailable) return
+  warnedZstdUnavailable = true
+  process.stderr.write('codeburn: DSH sessions need Node >= 22.15 (zstd support); skipping DSH usage.\n')
+}
 
 type ZstdFrame = { start: number; end: number }
 
@@ -165,7 +172,7 @@ function* readZstdLines(buffer: Buffer, maxFrames = Number.POSITIVE_INFINITY): G
 async function readEventLines(filePath: string): Promise<string[] | null> {
   if (filePath.endsWith('.zstd')) {
     if (!zstdDecompress) {
-      process.stderr.write('codeburn: DSH sessions need Node >= 22.15 (zstd support); skipping DSH usage.\n')
+      warnZstdUnavailable()
       return null
     }
     let buffer: Buffer
@@ -192,7 +199,10 @@ async function readEventLines(filePath: string): Promise<string[] | null> {
 async function readSessionHeader(filePath: string): Promise<DshEvent | null> {
   const firstLine = async (): Promise<string | null> => {
     if (filePath.endsWith('.zstd')) {
-      if (!zstdDecompress) return null
+      if (!zstdDecompress) {
+        warnZstdUnavailable()
+        return null
+      }
       let head: Buffer
       try {
         const handle = await open(filePath, 'r')

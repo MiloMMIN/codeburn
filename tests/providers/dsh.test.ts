@@ -14,6 +14,7 @@ import type { ParsedProviderCall } from '../../src/providers/types.js'
 // format than what DSH writes.
 
 const zstdCompress = (zlib as { zstdCompressSync?: (buf: Buffer) => Buffer }).zstdCompressSync
+const zstdUnavailable = !zstdCompress
 
 let tmpDir: string
 
@@ -119,7 +120,7 @@ async function parseAll(provider: ReturnType<typeof createDshProvider>, filePath
 }
 
 describe('dsh provider - session discovery', () => {
-  it('discovers a multi-frame zstd session, project from the header cwd', async () => {
+  it.skipIf(zstdUnavailable)('discovers a multi-frame zstd session, project from the header cwd', async () => {
     await writeZstdSession('--C-Users-test-myproject--', 'session-abc', [
       [sessionHeader({ cwd: 'C:\\Users\\test\\myproject' })],
       [assistantMessage(1, 1, { inputTokens: 100, outputTokens: 10 }, 1786707340000)],
@@ -196,7 +197,7 @@ describe('dsh provider - session discovery', () => {
 })
 
 describe('dsh provider - parsing', () => {
-  it('decodes events spread across multiple independent zstd frames', async () => {
+  it.skipIf(zstdUnavailable)('decodes events spread across multiple independent zstd frames', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-multi', [
       [sessionHeader({ id: 'session-multi', cwd: 'C:\\Users\\test\\myproject' })],
       [turnStart(1, 1786707339000), userMessage('build the thing', 1786707339100)],
@@ -210,7 +211,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[1]!.inputTokens).toBe(800)
   })
 
-  it('a final assistant/message usage REPLACES the earlier chunk sample for the same turn/step', async () => {
+  it.skipIf(zstdUnavailable)('a final assistant/message usage REPLACES the earlier chunk sample for the same turn/step', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-replace', [
       [sessionHeader({ id: 'session-replace' })],
       [turnStart(1, 1786707339000)],
@@ -228,7 +229,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.timestamp).toBe(new Date(1786707340050).toISOString())
   })
 
-  it('a chunk sample arriving after the final report does not overwrite it', async () => {
+  it.skipIf(zstdUnavailable)('a chunk sample arriving after the final report does not overwrite it', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-late', [
       [sessionHeader({ id: 'session-late' })],
       [assistantMessage(1, 1, { inputTokens: 100, outputTokens: 10 }, 1786707340050)],
@@ -240,7 +241,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.inputTokens).toBe(100)
   })
 
-  it('falls back to the chunk sample when no assistant/message usage arrives', async () => {
+  it.skipIf(zstdUnavailable)('falls back to the chunk sample when no assistant/message usage arrives', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-sample', [
       [sessionHeader({ id: 'session-sample' })],
       [chunkUsage(2, 3, { inputTokens: 42, outputTokens: 7 }, 1786707340000)],
@@ -252,7 +253,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.deduplicationKey).toBe('dsh:session-sample:2:3')
   })
 
-  it('steps inherit the model of the most recent request/header', async () => {
+  it.skipIf(zstdUnavailable)('steps inherit the model of the most recent request/header', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-model', [
       [sessionHeader({ id: 'session-model' })],
       [requestHeader('deepseek-v4-pro', 1786707337000)],
@@ -266,7 +267,7 @@ describe('dsh provider - parsing', () => {
     expect(calls.map(c => c.model)).toEqual(['deepseek-v4-pro', 'deepseek-v4-pro', 'deepseek-v4-flash'])
   })
 
-  it('bills reasoning tokens at the output rate', async () => {
+  it.skipIf(zstdUnavailable)('bills reasoning tokens at the output rate', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-reason', [
       [sessionHeader({ id: 'session-reason' })],
       [requestHeader('deepseek-v4-pro')],
@@ -278,7 +279,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.costUSD).toBeCloseTo(calculateCost('deepseek-v4-pro', 1000, 500, 50, 500, 0), 12)
   })
 
-  it('collects mapped tools, skill names and bash commands from tool/call events', async () => {
+  it.skipIf(zstdUnavailable)('collects mapped tools, skill names and bash commands from tool/call events', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-tools', [
       [sessionHeader({ id: 'session-tools' })],
       [
@@ -298,7 +299,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.skills).toEqual(['coding-agent-orchestration'])
   })
 
-  it('pairs the user message of the turn and carries session id and project', async () => {
+  it.skipIf(zstdUnavailable)('pairs the user message of the turn and carries session id and project', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-ctx', [
       [sessionHeader({ id: 'session-ctx', cwd: 'C:\\Users\\test\\myproject' })],
       [turnStart(1, 1786707339000), userMessage('first question', 1786707339100)],
@@ -330,7 +331,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.outputTokens).toBe(45)
   })
 
-  it('skips buckets whose usage is all zero', async () => {
+  it.skipIf(zstdUnavailable)('skips buckets whose usage is all zero', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-zero', [
       [sessionHeader({ id: 'session-zero' })],
       [assistantMessage(1, 1, { inputTokens: 0, outputTokens: 0 }, 1786707340000)],
@@ -340,7 +341,7 @@ describe('dsh provider - parsing', () => {
     expect(calls).toHaveLength(0)
   })
 
-  it('ignores a torn final frame appended by a crashed writer', async () => {
+  it.skipIf(zstdUnavailable)('ignores a torn final frame appended by a crashed writer', async () => {
     const dir = join(tmpDir, 'sessions', '--C-Users-test-myproject--', 'session-torn')
     await mkdir(dir, { recursive: true })
     const filePath = join(dir, 'session.jsonl.zstd')
@@ -356,7 +357,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.inputTokens).toBe(100)
   })
 
-  it('deduplicates (turn, step) calls seen across multiple parses', async () => {
+  it.skipIf(zstdUnavailable)('deduplicates (turn, step) calls seen across multiple parses', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-dedup', [
       [sessionHeader({ id: 'session-dedup' })],
       [chunkUsage(1, 1, { inputTokens: 100, outputTokens: 10 }, 1786707340000)],
