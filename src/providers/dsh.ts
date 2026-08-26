@@ -273,7 +273,10 @@ async function readEventLines(filePath: string): Promise<string[] | null> {
 async function readSessionHeader(filePath: string): Promise<DshEvent | null> {
   const firstLine = async (): Promise<string | null> => {
     if (filePath.endsWith('.zstd')) {
-      if (!zstdDecompress) return null
+      if (!zstdDecompress) {
+        notice('codeburn: DSH sessions need Node >= 22.15 (zstd support); skipping DSH usage.\n')
+        return null
+      }
       let head: Buffer
       try {
         const handle = await open(filePath, 'r')

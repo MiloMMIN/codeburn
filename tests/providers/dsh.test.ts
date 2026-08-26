@@ -219,7 +219,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[1]!.inputTokens).toBe(800)
   })
 
-  it('a final assistant/message usage REPLACES the earlier chunk sample for the same turn/step', async () => {
+  itZstd('a final assistant/message usage REPLACES the earlier chunk sample for the same turn/step', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-replace', [
       [sessionHeader({ id: 'session-replace' })],
       [turnStart(1, 1786707339000)],
@@ -237,7 +237,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.timestamp).toBe(new Date(1786707340050).toISOString())
   })
 
-  it('a chunk sample arriving after the final report does not overwrite it', async () => {
+  itZstd('a chunk sample arriving after the final report does not overwrite it', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-late', [
       [sessionHeader({ id: 'session-late' })],
       [assistantMessage(1, 1, { inputTokens: 100, outputTokens: 10 }, 1786707340050)],
@@ -249,7 +249,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.inputTokens).toBe(100)
   })
 
-  it('falls back to the chunk sample when no assistant/message usage arrives', async () => {
+  itZstd('falls back to the chunk sample when no assistant/message usage arrives', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-sample', [
       [sessionHeader({ id: 'session-sample' })],
       [chunkUsage(2, 3, { inputTokens: 42, outputTokens: 7 }, 1786707340000)],
@@ -261,7 +261,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.deduplicationKey).toBe('dsh:session-sample:2:3')
   })
 
-  it('steps inherit the model of the most recent request/header', async () => {
+  itZstd('steps inherit the model of the most recent request/header', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-model', [
       [sessionHeader({ id: 'session-model' })],
       [requestHeader('deepseek-v4-pro', 1786707337000)],
@@ -275,7 +275,7 @@ describe('dsh provider - parsing', () => {
     expect(calls.map(c => c.model)).toEqual(['deepseek-v4-pro', 'deepseek-v4-pro', 'deepseek-v4-flash'])
   })
 
-  it('bills reasoning tokens at the output rate', async () => {
+  itZstd('bills reasoning tokens at the output rate', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-reason', [
       [sessionHeader({ id: 'session-reason' })],
       [requestHeader('deepseek-v4-pro')],
@@ -287,7 +287,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.costUSD).toBeCloseTo(calculateCost('deepseek-v4-pro', 1000, 500, 50, 500, 0), 12)
   })
 
-  it('collects mapped tools, skill names and bash commands from tool/call events', async () => {
+  itZstd('collects mapped tools, skill names and bash commands from tool/call events', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-tools', [
       [sessionHeader({ id: 'session-tools' })],
       [
@@ -307,7 +307,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.skills).toEqual(['coding-agent-orchestration'])
   })
 
-  it('pairs the user message of the turn and carries session id and project', async () => {
+  itZstd('pairs the user message of the turn and carries session id and project', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-ctx', [
       [sessionHeader({ id: 'session-ctx', cwd: 'C:\\Users\\test\\myproject' })],
       [turnStart(1, 1786707339000), userMessage('first question', 1786707339100)],
@@ -339,7 +339,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.outputTokens).toBe(45)
   })
 
-  it('skips buckets whose usage is all zero', async () => {
+  itZstd('skips buckets whose usage is all zero', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-zero', [
       [sessionHeader({ id: 'session-zero' })],
       [assistantMessage(1, 1, { inputTokens: 0, outputTokens: 0 }, 1786707340000)],
@@ -365,7 +365,7 @@ describe('dsh provider - parsing', () => {
     expect(calls[0]!.inputTokens).toBe(100)
   })
 
-  it('deduplicates (turn, step) calls seen across multiple parses', async () => {
+  itZstd('deduplicates (turn, step) calls seen across multiple parses', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-dedup', [
       [sessionHeader({ id: 'session-dedup' })],
       [chunkUsage(1, 1, { inputTokens: 100, outputTokens: 10 }, 1786707340000)],
