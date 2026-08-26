@@ -1,7 +1,7 @@
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { join } from 'path'
-import { homedir } from 'os'
 
+import { getCodeburnCacheDir } from './cache-dir.js'
 import { readConfig } from './config.js'
 import { fetchWithTimeout } from './fetch-utils.js'
 
@@ -72,15 +72,8 @@ export function roundForActiveCurrency(value: number): number {
   return Math.round(value * factor) / factor
 }
 
-function getCacheDir(): string {
-  // Honor the same relocation override every other cache module uses
-  // (session-cache, daily-cache, codex-cache, models); this was the one
-  // straggler still hardcoding the default path.
-  return process.env['CODEBURN_CACHE_DIR'] ?? join(homedir(), '.cache', 'codeburn')
-}
-
 function getRateCachePath(): string {
-  return join(getCacheDir(), 'exchange-rate.json')
+  return join(getCodeburnCacheDir(), 'exchange-rate.json')
 }
 
 async function fetchRate(code: string): Promise<number> {
@@ -111,7 +104,7 @@ async function loadCachedRate(code: string): Promise<number | null> {
 }
 
 async function cacheRate(code: string, rate: number): Promise<void> {
-  await mkdir(getCacheDir(), { recursive: true })
+  await mkdir(getCodeburnCacheDir(), { recursive: true })
   await writeFile(getRateCachePath(), JSON.stringify({ timestamp: Date.now(), code, rate }))
 }
 
@@ -138,7 +131,13 @@ async function getExchangeRate(code: string): Promise<number> {
 
 export async function loadCurrency(): Promise<void> {
   const config = await readConfig()
-  if (!config.currency) return
+  if (!config.currency) {
+    // A long-lived `serve` process may previously have loaded a non-USD
+    // currency. Removing the config entry is the USD reset contract, so reset
+    // the module state as well as letting the output memo invalidate.
+    active = USD
+    return
+  }
 
   const code = config.currency.code.toUpperCase()
   const rate = await getExchangeRate(code)

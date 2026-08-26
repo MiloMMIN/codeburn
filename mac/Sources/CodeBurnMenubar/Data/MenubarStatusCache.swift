@@ -9,8 +9,9 @@ struct MenubarStatusCache {
 
     /// Default location under `~/.cache/codeburn/`.
     static func standard() -> MenubarStatusCache {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return MenubarStatusCache(statusPath: "\(home)/.cache/codeburn/menubar-status.json")
+        let cacheDir = CodeBurnCacheDirectory.resolve()
+        let path = (cacheDir as NSString).appendingPathComponent("menubar-status.json")
+        return MenubarStatusCache(statusPath: path)
     }
 
     struct BadgeRead {

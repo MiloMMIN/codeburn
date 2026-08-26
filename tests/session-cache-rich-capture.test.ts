@@ -12,8 +12,8 @@ import {
   emptyCache,
   loadCache,
   saveCache,
-  sessionCachePath,
 } from '../src/session-cache.js'
+import { writeCacheOnDisk } from './fixtures/session-cache-io.js'
 
 const TMP_DIR = join(tmpdir(), `codeburn-rich-cache-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
 
@@ -113,7 +113,7 @@ describe('session cache round-trip for rich-capture fields', () => {
       },
     }
     if (!existsSync(TMP_DIR)) await mkdir(TMP_DIR, { recursive: true })
-    await writeFile(sessionCachePath(), JSON.stringify(oldCache), 'utf-8')
+    await writeCacheOnDisk(oldCache)
 
     const loaded = await loadCache()
     const call = loaded.providers['claude']!.files['/x/old.jsonl']!.turns[0]!.calls[0]!

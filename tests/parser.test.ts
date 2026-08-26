@@ -14,7 +14,8 @@ import { createRequire } from 'node:module'
 
 import { isSqliteAvailable } from '../src/sqlite.js'
 import { clearSessionCache, parseAllSessions, setParseReuseValidator } from '../src/parser.js'
-import { loadCache, saveCache, sessionCachePath } from '../src/session-cache.js'
+import { loadCache, saveCache } from '../src/session-cache.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 import type { SessionSource, SessionParser, ParsedProviderCall } from '../src/providers/types.js'
 
 // ── Synthetic provider state ───────────────────────────────────────────────
@@ -23,6 +24,7 @@ import type { SessionSource, SessionParser, ParsedProviderCall } from '../src/pr
 let _synthSources: SessionSource[] = []
 let _synthDurable = false
 let _synthYields: ParsedProviderCall[] = []
+let _synthOnParse: (() => void | Promise<void>) | null = null
 
 vi.mock('../src/providers/index.js', async (importOriginal) => {
   type Mod = typeof import('../src/providers/index.js')
@@ -52,6 +54,7 @@ vi.mock('../src/providers/index.js', async (importOriginal) => {
           createSessionParser(_s: SessionSource, _k: Set<string>): SessionParser {
             return {
               async *parse(): AsyncGenerator<ParsedProviderCall> {
+                await _synthOnParse?.()
                 for (const call of _synthYields) {
                   // Respect seenKeys so that when multiple sources share the same
                   // dedup key, only the first source yields it (mirrors real parsers).
@@ -190,13 +193,16 @@ beforeEach(async () => {
   _synthSources = []
   _synthDurable = false
   _synthYields  = []
+  _synthOnParse = null
 })
 
 afterEach(async () => {
   clearSessionCache()
+  setParseReuseValidator(null)
   vi.unstubAllEnvs()
 
   _synthSources = []
+  _synthOnParse = null
 
   await rm(tmpHome,  { recursive: true, force: true })
   await rm(tmpCache, { recursive: true, force: true })
@@ -444,12 +450,10 @@ describe('(f) durable orphans survive a parse-version bump', () => {
 
     // Simulate the fingerprint a PREVIOUS release computed (any mismatching
     // value takes the same code path as a real parse-version bump).
-    const { readFile, writeFile: writeFileFs } = await import('fs/promises')
-    const cachePath = sessionCachePath()
-    const disk = JSON.parse(await readFile(cachePath, 'utf-8')) as { providers: Record<string, { envFingerprint: string }> }
+    const disk = await readCacheOnDisk()
     expect(disk.providers['copilot']).toBeDefined()
     disk.providers['copilot']!.envFingerprint = '0000000000000000'
-    await writeFileFs(cachePath, JSON.stringify(disk), 'utf-8')
+    await writeCacheOnDisk(disk)
 
     // First parse after the "upgrade": the orphan must still be counted and
     // must survive in the rewritten cache, not be erased with the section.
@@ -728,6 +732,75 @@ describe('(q) parse burst reuse (CODEBURN_PARSE_BURST_MS)', () => {
 })
 
 describe('(r) validated parse reuse (setParseReuseValidator)', () => {
+  it('falls back to the exact TTL when watcher coverage is unknown, but rejects dirty', async () => {
+    vi.stubEnv('CODEBURN_PARSE_BURST_MS', '0')
+    clearSessionCache()
+    const start = new Date(Date.now() - 60 * 60 * 1000)
+    const end = new Date()
+    const ts = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+    const synthFile = join(tmpHome, 'synth-unknown-exact.txt')
+    await writeFile(synthFile, 'first input')
+    _synthSources = [{ path: synthFile, project: 'p', provider: 'test-synthetic' }]
+    _synthYields = [{
+      provider: 'test-synthetic', model: 'synth-model',
+      inputTokens: 1, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costUSD: 0, costIsEstimated: false, tools: [], bashCommands: [], skills: [],
+      timestamp: ts, speed: 'standard', deduplicationKey: 'synth-unknown-exact-1', userMessage: 'hi', sessionId: 'sue-1',
+    }] as never
+
+    expect(totalOutput(await parseAllSessions({ start, end }, 'test-synthetic'))).toBe(5)
+    _synthYields = [..._synthYields, {
+      ...( _synthYields[0] as object ), deduplicationKey: 'synth-unknown-exact-2', outputTokens: 7,
+    }] as never
+    await writeFile(synthFile, 'second input with changed fingerprint')
+
+    // An unhealthy/pre-arm watcher cannot extend freshness, but it must retain
+    // the normal exact-key TTL instead of forcing a full rescan every request.
+    setParseReuseValidator(() => 'unknown')
+    expect(totalOutput(await parseAllSessions({ start, end }, 'test-synthetic'))).toBe(5)
+
+    // The same entry must be rejected immediately once a real change is known.
+    setParseReuseValidator(() => 'dirty')
+    expect(totalOutput(await parseAllSessions({ start, end }, 'test-synthetic'))).toBe(12)
+  })
+
+  it('falls back to the short burst when watcher coverage is unknown, but dirty wins inside it', async () => {
+    vi.stubEnv('CODEBURN_PARSE_BURST_MS', '10000')
+    clearSessionCache()
+    const start = new Date(Date.now() - 60 * 60 * 1000)
+    const firstEnd = new Date()
+    const ts = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+    const synthFile = join(tmpHome, 'synth-unknown-burst.txt')
+    await writeFile(synthFile, 'first input')
+    _synthSources = [{ path: synthFile, project: 'p', provider: 'test-synthetic' }]
+    _synthYields = [{
+      provider: 'test-synthetic', model: 'synth-model',
+      inputTokens: 1, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costUSD: 0, costIsEstimated: false, tools: [], bashCommands: [], skills: [],
+      timestamp: ts, speed: 'standard', deduplicationKey: 'synth-unknown-burst-1', userMessage: 'hi', sessionId: 'sub-1',
+    }] as never
+
+    expect(totalOutput(await parseAllSessions({ start, end: firstEnd }, 'test-synthetic'))).toBe(5)
+    _synthYields = [..._synthYields, {
+      ...( _synthYields[0] as object ), deduplicationKey: 'synth-unknown-burst-2', outputTokens: 7,
+    }] as never
+    await writeFile(synthFile, 'second input with changed fingerprint')
+
+    setParseReuseValidator(() => 'unknown')
+    expect(totalOutput(await parseAllSessions(
+      { start, end: new Date(firstEnd.getTime() + 100) },
+      'test-synthetic',
+    ))).toBe(5)
+
+    setParseReuseValidator(() => 'dirty')
+    expect(totalOutput(await parseAllSessions(
+      { start, end: new Date(firstEnd.getTime() + 200) },
+      'test-synthetic',
+    ))).toBe(12)
+  })
+
   it('reuses past the burst window while the validator reports quiet, never when dirty', async () => {
     vi.stubEnv('CODEBURN_PARSE_BURST_MS', '1')
     clearSessionCache()
@@ -750,14 +823,14 @@ describe('(r) validated parse reuse (setParseReuseValidator)', () => {
     // 1ms burst window has certainly elapsed; with a quiet validator the
     // previous parse is still served (world changed, result must not).
     await new Promise(r => setTimeout(r, 5))
-    setParseReuseValidator(() => true)
+    setParseReuseValidator(() => 'clean')
     _synthYields = [..._synthYields, { ...( _synthYields[0] as object ), deduplicationKey: 'synth-val-2', outputTokens: 7 }] as never
     await writeFile(synthFile, 'placeholder v2')
     const second = await parseAllSessions({ start, end: new Date(Date.now() + 500) }, 'test-synthetic')
     expect(totalOutput(second)).toBe(5)
 
     // A dirty validator ends the reuse: fresh parse sees the new call.
-    setParseReuseValidator(() => false)
+    setParseReuseValidator(() => 'dirty')
     const third = await parseAllSessions({ start, end: new Date(Date.now() + 1000) }, 'test-synthetic')
     expect(totalOutput(third)).toBe(12)
 
@@ -765,5 +838,86 @@ describe('(r) validated parse reuse (setParseReuseValidator)', () => {
     vi.unstubAllEnvs()
     _synthSources = []
     _synthYields = []
+  })
+
+  it('rejects an exact-key memo when a root event arrived during its parse', async () => {
+    clearSessionCache()
+    const start = new Date(Date.now() - 60 * 60 * 1000)
+    const end = new Date()
+    const ts = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+    const synthFile = join(tmpHome, 'synth-exact-event-during-parse.txt')
+    await writeFile(synthFile, 'first input')
+    _synthSources = [{ path: synthFile, project: 'p', provider: 'test-synthetic' }]
+    _synthYields = [{
+      provider: 'test-synthetic', model: 'synth-model',
+      inputTokens: 1, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costUSD: 0, costIsEstimated: false, tools: [], bashCommands: [], skills: [],
+      timestamp: ts, speed: 'standard', deduplicationKey: 'synth-exact-event-1', userMessage: 'hi', sessionId: 'see-1',
+    }] as never
+
+    let rootEventAt = 0
+    setParseReuseValidator(sinceTs => rootEventAt === 0 || rootEventAt < sinceTs ? 'clean' : 'dirty')
+    _synthOnParse = async () => {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      rootEventAt = Date.now()
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    const first = await parseAllSessions({ start, end }, 'test-synthetic')
+    expect(totalOutput(first)).toBe(5)
+    _synthOnParse = null
+
+    _synthYields = [..._synthYields, {
+      ...( _synthYields[0] as object ), deduplicationKey: 'synth-exact-event-2', outputTokens: 7,
+    }] as never
+    await writeFile(synthFile, 'second input')
+    const second = await parseAllSessions({ start, end }, 'test-synthetic')
+    expect(totalOutput(second)).toBe(12)
+  })
+
+  it('does not bless a root event that arrived while the cached parse was running', async () => {
+    vi.stubEnv('CODEBURN_PARSE_BURST_MS', '1')
+    clearSessionCache()
+    const start = new Date(Date.now() - 60 * 60 * 1000)
+    const firstEnd = new Date()
+    const ts = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+    const synthFile = join(tmpHome, 'synth-event-during-parse.txt')
+    await writeFile(synthFile, 'first input')
+    _synthSources = [{ path: synthFile, project: 'p', provider: 'test-synthetic' }]
+    _synthYields = [{
+      provider: 'test-synthetic', model: 'synth-model',
+      inputTokens: 1, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costUSD: 0, costIsEstimated: false, tools: [], bashCommands: [], skills: [],
+      timestamp: ts, speed: 'standard', deduplicationKey: 'synth-event-1', userMessage: 'hi', sessionId: 'se-1',
+    }] as never
+
+    let rootEventAt = 0
+    _synthOnParse = async () => {
+      // Bracket the controlled event so it is strictly after parse start and
+      // strictly before completion, independent of same-millisecond clocks.
+      await new Promise(resolve => setTimeout(resolve, 10))
+      rootEventAt = Date.now()
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    const first = await parseAllSessions({ start, end: firstEnd }, 'test-synthetic')
+    expect(totalOutput(first)).toBe(5)
+    expect(rootEventAt).toBeGreaterThan(0)
+    _synthOnParse = null
+
+    // Outside the 1ms burst, old code validated against cachePut completion
+    // and reused stale output because the in-parse event appeared older. The
+    // parse-start timestamp makes the validator reject reuse and rescan.
+    await new Promise(resolve => setTimeout(resolve, 5))
+    setParseReuseValidator(sinceTs => rootEventAt < sinceTs ? 'clean' : 'dirty')
+    _synthYields = [..._synthYields, {
+      ...( _synthYields[0] as object ), deduplicationKey: 'synth-event-2', outputTokens: 7,
+    }] as never
+    await writeFile(synthFile, 'second input')
+    const second = await parseAllSessions(
+      { start, end: new Date(firstEnd.getTime() + 500) },
+      'test-synthetic',
+    )
+    expect(totalOutput(second)).toBe(12)
   })
 })

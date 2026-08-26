@@ -6,7 +6,7 @@ import { homedir } from 'os'
 
 import { readSessionLines } from '../fs-utils.js'
 import { calculateCost } from '../models.js'
-import { readCachedCodexResults, writeCachedCodexResults, getCachedCodexProject, fingerprintFile } from '../codex-cache.js'
+import { readCachedCodexResults, writeCachedCodexResults, getCachedCodexProject, fingerprintFile, type CodexFileFingerprint } from '../codex-cache.js'
 import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
@@ -569,52 +569,131 @@ function resolveModel(info: CodexEntry['payload'], sessionModel?: string): strin
   return firstModelString(info?.model, info?.info?.model, info?.info?.model_name, sessionModel) ?? 'gpt-5'
 }
 
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+// Everything the single-pass decode carries across a `task_started` boundary.
+// A rollout is append-only, so recording this at such a boundary (where the
+// previous task has been flushed to `results` and the per-task accumulators are
+// empty) lets a later run restart there and produce byte-identical output
+// instead of re-reading the whole file. Every field the loop below reads from a
+// PRIOR line must appear here, or a resumed decode silently diverges.
+type CodexResumeState = {
+  sessionModel?: string
+  sessionId: string
+  sessionCwd?: string
+  forkedFromId: string
+  forkCutoff: string
+  prevCumulativeTotal: number | null
+  prevInput: number
+  prevCached: number
+  prevOutput: number
+  prevReasoning: number
+  pendingTools: string[]
+  pendingToolSequence: ToolCall[][]
+  pendingUserMessage: string
+  pendingOutputChars: number
+  pendingLocAdded: number
+  pendingLocRemoved: number
+  pendingEditFailed: number
+  estCounter: number
+  turnCounter: number
+  currentTurnId: string
+  taskStartedAt?: number
+}
+
+// The state comes back off our own JSON cache; a truncated or hand-edited file
+// must fall back to a full re-parse rather than decode against nonsense.
+function isResumeState(value: unknown): value is CodexResumeState {
+  if (!value || typeof value !== 'object') return false
+  const v = value as Record<string, unknown>
+  return typeof v['sessionId'] === 'string'
+    && typeof v['forkedFromId'] === 'string'
+    && typeof v['forkCutoff'] === 'string'
+    && (v['prevCumulativeTotal'] === null || typeof v['prevCumulativeTotal'] === 'number')
+    && typeof v['prevInput'] === 'number'
+    && typeof v['prevCached'] === 'number'
+    && typeof v['prevOutput'] === 'number'
+    && typeof v['prevReasoning'] === 'number'
+    && Array.isArray(v['pendingTools'])
+    && Array.isArray(v['pendingToolSequence'])
+    && typeof v['pendingUserMessage'] === 'string'
+    && typeof v['pendingOutputChars'] === 'number'
+    && typeof v['pendingLocAdded'] === 'number'
+    && typeof v['pendingLocRemoved'] === 'number'
+    && typeof v['pendingEditFailed'] === 'number'
+    && typeof v['estCounter'] === 'number'
+    && typeof v['turnCounter'] === 'number'
+    && typeof v['currentTurnId'] === 'string'
+}
+
+/** What the serial path would have written to the codex cache for one file. */
+export type CodexCacheWrite = {
+  project: string
+  fingerprint: CodexFileFingerprint
+  resume?: { offset: number; state: unknown; callCount: number }
+}
+
+// When `capture` is passed the parse is a whole-file decode that never touches
+// the codex cache: no hit lookup (so no resume), and the entry it would have
+// written comes back through `capture` for the caller to install. That is what
+// lets a worker thread run this exact decode without owning the cache module's
+// per-directory state.
+function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { write?: CodexCacheWrite }): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const cached = await readCachedCodexResults(source.path)
-      if (cached) {
-        for (const call of cached) {
+      const hit = capture ? null : await readCachedCodexResults(source.path)
+      if (hit?.kind === 'exact') {
+        for (const call of hit.calls) {
           if (seenKeys.has(call.deduplicationKey)) continue
           seenKeys.add(call.deduplicationKey)
           yield call
         }
         return
       }
+      const resume = hit && isResumeState(hit.state)
+        ? { offset: hit.offset, state: hit.state, calls: hit.calls.slice(0, hit.callCount) }
+        : null
 
       const fp = await fingerprintFile(source.path)
       if (!fp) return
 
-      let sessionModel: string | undefined
-      let sessionId = ''
-      let sessionCwd: string | undefined
-      let forkedFromId = ''
-      let forkCutoff = ''
+      let sessionModel: string | undefined = resume?.state.sessionModel
+      let sessionId = resume?.state.sessionId ?? ''
+      let sessionCwd: string | undefined = resume?.state.sessionCwd
+      let forkedFromId = resume?.state.forkedFromId ?? ''
+      let forkCutoff = resume?.state.forkCutoff ?? ''
       // Null sentinel rather than `0` so the FIRST event is never confused
       // with a duplicate. A session that only emits last_token_usage (no
       // total_token_usage) reports cumulativeTotal=0 on every event; with a
       // 0-initialized prev, the first event would have matched and been
       // dropped. Once we've observed any event, we record its cumulative
       // total and dedup on equality regardless of whether it is zero.
-      let prevCumulativeTotal: number | null = null
-      let prevInput = 0
-      let prevCached = 0
-      let prevOutput = 0
-      let prevReasoning = 0
-      let pendingTools: string[] = []
-      let pendingToolSequence: ToolCall[][] = []
-      let pendingUserMessage = ''
-      let pendingOutputChars = 0
+      let prevCumulativeTotal: number | null = resume?.state.prevCumulativeTotal ?? null
+      let prevInput = resume?.state.prevInput ?? 0
+      let prevCached = resume?.state.prevCached ?? 0
+      let prevOutput = resume?.state.prevOutput ?? 0
+      let prevReasoning = resume?.state.prevReasoning ?? 0
+      let pendingTools: string[] = resume ? [...resume.state.pendingTools] : []
+      let pendingToolSequence: ToolCall[][] = resume ? [...resume.state.pendingToolSequence] : []
+      let pendingUserMessage = resume?.state.pendingUserMessage ?? ''
+      let pendingOutputChars = resume?.state.pendingOutputChars ?? 0
       // Rich-session-capture: edit LOC deltas and failed-patch count accumulated
       // across a turn's patch_apply_end events, flushed onto the turn's call.
-      let pendingLocAdded = 0
-      let pendingLocRemoved = 0
-      let pendingEditFailed = 0
-      let estCounter = 0
-      let turnCounter = 0
-      let currentTurnId = `${sessionId}:t0`
+      let pendingLocAdded = resume?.state.pendingLocAdded ?? 0
+      let pendingLocRemoved = resume?.state.pendingLocRemoved ?? 0
+      let pendingEditFailed = resume?.state.pendingEditFailed ?? 0
+      let estCounter = resume?.state.estCounter ?? 0
+      let turnCounter = resume?.state.turnCounter ?? 0
+      let currentTurnId = resume?.state.currentTurnId ?? `${sessionId}:t0`
       let sawAnyLine = false
       const results: ParsedProviderCall[] = []
+      // Calls already decoded before the resume boundary. They pass through the
+      // same cross-provider dedup a full decode would have applied to them.
+      if (resume) {
+        for (const call of resume.calls) {
+          if (seenKeys.has(call.deduplicationKey)) continue
+          seenKeys.add(call.deduplicationKey)
+          results.push(call)
+        }
+      }
       // Calls decoded since the last task_started, held back so task_complete can
       // stamp active/toolWait timing before they are appended to results. Emitting
       // a task only once its timing is known keeps single-pass and split/resume
@@ -623,15 +702,25 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       let pendingTaskCalls: ParsedProviderCall[] = []
       let taskGeneratedTokens = 0
       let taskToolIntervals: Array<[number, number]> = []
-      let taskStartedAt: number | undefined
+      let taskStartedAt: number | undefined = resume?.state.taskStartedAt
       const openToolStarts = new Map<string, number>()
+
+      // Resume point for the NEXT run, refreshed at every task boundary.
+      const tracker = { lastCompleteLineOffset: resume?.offset ?? 0 }
+      let resumeOffset = resume?.offset ?? 0
+      let resumeState: CodexResumeState | null = resume?.state ?? null
+      let resumeCallCount = results.length
 
       // Stream the session file line by line. Heavy Codex sessions can exceed
       // 250 MB on disk; reading the entire file into a string would either hit
       // the readSessionFile cap or push V8 toward its 512 MB string limit
       // after split('\n'). readSessionLines streams raw buffers and hands
       // huge lines to the compact parser without full string conversion.
-      for await (const rawLine of readSessionLines(source.path, undefined, { largeLineAsBuffer: true })) {
+      for await (const rawLine of readSessionLines(source.path, undefined, {
+        largeLineAsBuffer: true,
+        byteOffsetTracker: tracker,
+        ...(resume ? { startByteOffset: resume.offset } : {}),
+      })) {
         sawAnyLine = true
         const entry = parseCodexLine(rawLine)
         if (!entry) continue
@@ -684,6 +773,33 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           const startedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
           taskStartedAt = Number.isFinite(startedAt) ? startedAt : undefined
           openToolStarts.clear()
+          // Everything decoded so far is now in `results` and the per-task
+          // accumulators are empty: a clean restart point for an appended tail.
+          resumeOffset = tracker.lastCompleteLineOffset
+          resumeCallCount = results.length
+          resumeState = {
+            ...(sessionModel !== undefined ? { sessionModel } : {}),
+            sessionId,
+            ...(sessionCwd !== undefined ? { sessionCwd } : {}),
+            forkedFromId,
+            forkCutoff,
+            prevCumulativeTotal,
+            prevInput,
+            prevCached,
+            prevOutput,
+            prevReasoning,
+            pendingTools: [...pendingTools],
+            pendingToolSequence: [...pendingToolSequence],
+            pendingUserMessage,
+            pendingOutputChars,
+            pendingLocAdded,
+            pendingLocRemoved,
+            pendingEditFailed,
+            estCounter,
+            turnCounter,
+            currentTurnId,
+            ...(taskStartedAt !== undefined ? { taskStartedAt } : {}),
+          }
           continue
         }
 
@@ -997,19 +1113,43 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
       // If the stream yielded nothing the file was unreadable, oversized, or
       // empty. Skip cache write so a transient failure can't pin an empty
-      // result set against a fingerprint that would otherwise be re-parsed.
-      if (!sawAnyLine) return
+      // result set against a fingerprint that would otherwise be re-parsed. On a
+      // resume the earlier calls are still valid output, so serve them - but
+      // still leave the cache entry alone.
+      if (!sawAnyLine) {
+        if (resume) for (const call of results) yield call
+        return
+      }
 
       // Flush the final task, which has no following task_started to trigger it.
       results.push(...pendingTaskCalls)
 
-      await writeCachedCodexResults(source.path, source.project, results, fp)
+      const resumeWrite = resumeState ? { offset: resumeOffset, state: resumeState, callCount: resumeCallCount } : undefined
+      if (capture) {
+        capture.write = { project: source.project, fingerprint: fp, ...(resumeWrite ? { resume: resumeWrite } : {}) }
+      } else {
+        await writeCachedCodexResults(source.path, source.project, results, fp, resumeWrite)
+      }
 
       for (const call of results) {
         yield call
       }
     },
   }
+}
+
+export type CodexFullParse = { calls: ParsedProviderCall[]; write?: CodexCacheWrite }
+
+/// Decode one rollout end to end, exactly as the serial path does for a file
+/// with no cache entry, without reading or writing the codex cache. `seenKeys`
+/// is the dedup set the decode runs against — pass an empty one off-thread and
+/// let the caller prove no earlier file claimed any of the keys before
+/// installing the result.
+export async function parseCodexFileFull(source: SessionSource, seenKeys: Set<string>): Promise<CodexFullParse> {
+  const capture: { write?: CodexCacheWrite } = {}
+  const calls: ParsedProviderCall[] = []
+  for await (const call of createParser(source, seenKeys, capture).parse()) calls.push(call)
+  return { calls, ...(capture.write ? { write: capture.write } : {}) }
 }
 
 export function createCodexProvider(codexDir?: string): Provider {

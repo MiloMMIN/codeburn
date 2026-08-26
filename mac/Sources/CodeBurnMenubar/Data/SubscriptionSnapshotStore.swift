@@ -14,13 +14,8 @@ struct SubscriptionSnapshot: Codable, Sendable {
 private let snapshotFilename = "subscription-snapshots.json"
 private let pruneOlderThanSeconds: TimeInterval = 30 * 24 * 3600
 
-private func snapshotsCacheDir() -> String {
-    return ProcessInfo.processInfo.environment["CODEBURN_CACHE_DIR"]
-        ?? (NSHomeDirectory() as NSString).appendingPathComponent(".cache/codeburn")
-}
-
 private func snapshotsPath() -> String {
-    return (snapshotsCacheDir() as NSString).appendingPathComponent(snapshotFilename)
+    return (CodeBurnCacheDirectory.resolve() as NSString).appendingPathComponent(snapshotFilename)
 }
 
 private actor SnapshotLock {

@@ -24,3 +24,35 @@ export function normalizeContentBlocks<T extends { type?: string; text?: string 
   if (typeof content === 'string') return [{ type: 'text', text: content } as T]
   return []
 }
+
+/// Take a bounded prefix of a string as a FLAT copy.
+///
+/// `String.prototype.slice` returns a V8 SlicedString — a view object that
+/// retains a reference to its ENTIRE parent string. Session files routinely
+/// carry 100KB+ message strings (agent-injected system prompts, tool
+/// results); storing a short `.slice()` of each in a long-lived structure
+/// (the session cache) pins every parent buffer for the life of the process.
+/// Across thousands of session files this balloons a cold parse of a few GB
+/// of JSONL into an out-of-memory crash (~5.5GB peak observed), while a warm
+/// run — whose strings were flattened by the cache's JSON round-trip — needs
+/// only ~300MB for the same data.
+///
+/// Round-tripping through a Buffer forces a fresh flat string with no parent
+/// reference. This always runs, even when `s` is already within `max`:
+/// callers may pass an already-sliced view (provider adapters pre-truncate
+/// with `.slice(0, 500)` before the cache-site call), and that view is
+/// itself a SlicedString pinning its own large parent.
+export function flatSlice(s: string, max: number): string {
+  return Buffer.from(s.slice(0, max), 'utf16le').toString('utf16le')
+}
+
+/// Force a FLAT copy of a string regardless of length.
+///
+/// Companion to `flatSlice` for strings that are ALREADY short but were
+/// produced as views over a large parent — regex match groups
+/// (`match[1]` retains the entire subject string) and `trim()` results
+/// both come back as V8 SlicedStrings. Use this when storing such values
+/// in long-lived structures; use `flatSlice` when also bounding length.
+export function flatString(s: string): string {
+  return Buffer.from(s, 'utf16le').toString('utf16le')
+}

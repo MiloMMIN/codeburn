@@ -20,7 +20,7 @@ vi.mock('../src/fs-utils.js', async (importOriginal) => {
 })
 
 import { parseAllSessions, clearSessionCache } from '../src/parser.js'
-import { sessionCachePath } from '../src/session-cache.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 import type { ProjectSummary } from '../src/types.js'
 
 let tmpDir: string
@@ -129,8 +129,8 @@ describe('incremental append parsing', () => {
     await writeFile(sessionPath, baseLines().join('\n') + '\n')
     await parseWith(warmCache)
 
-    const cachedOffset: number = JSON.parse(await readFile(sessionCachePath(), 'utf-8'))
-      .providers.claude.files[sessionPath].lastCompleteLineOffset
+    const cachedOffset = (await readCacheOnDisk())
+      .providers['claude']!.files[sessionPath]!.lastCompleteLineOffset!
     expect(cachedOffset).toBeGreaterThan(0)
 
     // 2) append a new complete turn plus a torn (invalid JSON, no newline) tail.
@@ -317,10 +317,9 @@ describe('incremental append parsing', () => {
     await parseWith(warmCache)
 
     // Corrupt the persisted offset to point far beyond the file, then grow it.
-    const cachePath = sessionCachePath()
-    const cache = JSON.parse(await readFile(cachePath, 'utf-8'))
-    cache.providers.claude.files[sessionPath].lastCompleteLineOffset = 10_000_000
-    await writeFile(cachePath, JSON.stringify(cache))
+    const cache = await readCacheOnDisk()
+    cache.providers['claude']!.files[sessionPath]!.lastCompleteLineOffset = 10_000_000
+    await writeCacheOnDisk(cache)
 
     await appendFile(sessionPath,
       userLine('2026-05-01T13:00:00.000Z', 'grow the file') + '\n' +

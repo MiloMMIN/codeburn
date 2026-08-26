@@ -8,7 +8,7 @@ import {
   type RefreshLockClock,
 } from '../src/cache-refresh-lock.js'
 import { clearSessionCache, parseAllSessions } from '../src/parser.js'
-import { emptyCache, loadCache, saveCache, sessionCachePath } from '../src/session-cache.js'
+import { emptyCache, loadCache, saveCache, sessionCacheDir } from '../src/session-cache.js'
 
 const dirs: string[] = []
 
@@ -202,7 +202,7 @@ describe('warm session-cache refresh lock', () => {
 
     await result.handle.release()
     expect(JSON.parse(await readFile(lockPath(dir), 'utf-8')).token).toBe('successor')
-    expect(sessionCachePath()).toContain(dir)
+    expect(sessionCacheDir()).toContain(dir)
   })
 
   // retry shields environmental fd/CPU starvation in a saturated full-suite

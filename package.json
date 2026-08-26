@@ -8,7 +8,9 @@
     "codeburn": "dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "THIRD_PARTY_NOTICES.md",
+    "!dist/parse-worker.js.map"
   ],
   "scripts": {
     "bundle-litellm": "node scripts/bundle-litellm.mjs",
@@ -32,6 +34,7 @@
     "pi",
     "codebuff",
     "codewhale",
+    "dsh",
     "ai-coding",
     "token-usage",
     "cost-tracking",

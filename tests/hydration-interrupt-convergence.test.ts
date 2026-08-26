@@ -6,7 +6,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { loadPricing, setLocalModelSavings, setModelAliases } from '../src/models.js'
 import { buildMenubarPayloadForRange } from '../src/usage-aggregator.js'
 import { clearSessionCache } from '../src/parser.js'
-import { sessionCachePath } from '../src/session-cache.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 import { dailyCachePath } from '../src/daily-cache.js'
 import type { DateRange } from '../src/types.js'
 
@@ -91,9 +91,9 @@ describe('interrupted hydration converges to the uninterrupted result', () => {
 
     // (a) Session cache: present but NOT marked complete — an interrupted cold
     //     start's throttled partial save.
-    const sessionRaw = JSON.parse(await readFile(sessionCachePath(), 'utf-8'))
+    const sessionRaw = await readCacheOnDisk()
     sessionRaw.complete = false
-    await writeFile(sessionCachePath(), JSON.stringify(sessionRaw), 'utf-8')
+    await writeCacheOnDisk(sessionRaw)
 
     // (b) Daily cache: frozen with the older days dropped but `lastComputedDate`
     //     advanced to yesterday and NO completeness marker — the exact freeze that
@@ -118,7 +118,7 @@ describe('interrupted hydration converges to the uninterrupted result', () => {
     expect(healed.current.calls).toBe(reference.current.calls)
 
     // And the on-disk markers are now durably complete, so the next launch is warm.
-    expect(JSON.parse(await readFile(sessionCachePath(), 'utf-8')).complete).toBe(true)
+    expect((await readCacheOnDisk()).complete).toBe(true)
     expect(JSON.parse(await readFile(dailyCachePath(), 'utf-8')).complete).toBe(true)
   })
 })

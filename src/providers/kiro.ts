@@ -5,6 +5,7 @@ import { basename, dirname, extname, join } from 'path'
 import { homedir } from 'os'
 
 import { readSessionFile } from '../fs-utils.js'
+import { flatSlice, flatString } from '../content-utils.js'
 import { calculateCost } from '../models.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
@@ -98,7 +99,10 @@ function extractToolNames(content: string): string[] {
   let match
   while ((match = regex.exec(content)) !== null) {
     const name = match[1]!.trim()
-    tools.push(toolNameMap[name] ?? name)
+    // flatString: regex match groups are V8 SlicedStrings that retain the
+    // ENTIRE subject string — storing them in the session cache would pin
+    // every scanned assistant-content buffer. Mapped names are flat literals.
+    tools.push(toolNameMap[name] ?? flatString(name))
   }
   return tools
 }
@@ -217,7 +221,7 @@ function parseChatFile(data: KiroChatFile, sessionId: string, project: string, s
     if (msg.role === 'human') {
       if (msg.content.startsWith('<identity>')) continue
       inputChars += msg.content.length
-      pendingUserMessage = msg.content.slice(0, 500)
+      pendingUserMessage = flatSlice(msg.content, 500)
     }
     if (msg.role === 'bot') {
       const msgTools = extractToolNames(msg.content)
@@ -296,7 +300,7 @@ function parseModernExecution(data: KiroModernExecution, sourcePath: string, see
 
   if (directInput) {
     inputChars += directInput.length
-    pendingUserMessage = directInput.slice(0, 500)
+    pendingUserMessage = flatSlice(directInput, 500)
   }
 
   if (directOutput) {
@@ -328,7 +332,7 @@ function parseModernExecution(data: KiroModernExecution, sourcePath: string, see
         if (role === 'human' || role === 'user') {
           if (!text) continue
           inputChars += text.length
-          pendingUserMessage = text.slice(0, 500)
+          pendingUserMessage = flatSlice(text, 500)
         } else if (role === 'bot' || role === 'assistant' || role === 'ai' || role === 'model') {
           if (text) outputChars += text.length
           if (text || tools.length > 0) hasOutputActivity = true
@@ -506,6 +510,7 @@ function parseCliSession(meta: KiroCliSessionMeta, entries: KiroCliEntry[], seen
       userMessage: pendingUserMessage,
       sessionId,
       project,
+      ...(meta.cwd ? { projectPath: meta.cwd } : {}),
     })
     turnIndex++
   }
@@ -526,7 +531,7 @@ function parseCliSession(meta: KiroCliSessionMeta, entries: KiroCliEntry[], seen
         for (const item of content) {
           const rec = asRecord(item)
           if (rec && rec['kind'] === 'text' && typeof rec['data'] === 'string') {
-            pendingUserMessage = (rec['data'] as string).slice(0, 500)
+            pendingUserMessage = flatSlice(rec['data'] as string, 500)
             inputChars += (rec['data'] as string).length
           }
         }
@@ -605,7 +610,7 @@ async function parseWorkspaceSession(record: Record<string, unknown>, source: Se
     const text = extractText(msg['content'])
     if (role === 'user' && text) {
       inputChars += text.length
-      pendingUserMessage = text.slice(0, 500)
+      pendingUserMessage = flatSlice(text, 500)
     } else if (role === 'assistant' && !execBacked && text && text !== 'On it.') {
       // An item carrying an executionId is execution-backed: its content is
       // counted from the execution file, so counting it here would double-count.
@@ -662,6 +667,9 @@ async function parseWorkspaceSession(record: Record<string, unknown>, source: Se
     deduplicationKey: dedupKey,
     userMessage: pendingUserMessage,
     sessionId,
+    ...(typeof record['workspaceDirectory'] === 'string' && record['workspaceDirectory']
+      ? { projectPath: record['workspaceDirectory'] as string }
+      : {}),
   })
 
   return results
@@ -774,6 +782,7 @@ async function parseV2Session(source: SessionSource, seenKeys: Set<string>): Pro
           userMessage: turnUserMessage,
           sessionId,
           project: source.project,
+          ...(meta.workspacePaths?.[0] ? { projectPath: meta.workspacePaths[0] } : {}),
         })
       }
     }
@@ -794,7 +803,7 @@ async function parseV2Session(source: SessionSource, seenKeys: Set<string>): Pro
       // for the upcoming turn_start.
       if (inTurn) flushTurn()
       const text = typeof payload['content'] === 'string' ? payload['content'] as string : extractText(payload['content'])
-      pendingUserMessage = text.slice(0, 500)
+      pendingUserMessage = flatSlice(text, 500)
       pendingUserChars = text.length
     } else if (type === 'turn_start') {
       if (inTurn) flushTurn()

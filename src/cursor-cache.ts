@@ -1,8 +1,8 @@
 import { readFile, writeFile, mkdir, rename, stat, unlink } from 'fs/promises'
 import { join } from 'path'
-import { homedir } from 'os'
 import { randomBytes } from 'crypto'
 
+import { getCodeburnCacheDir } from './cache-dir.js'
 import type { ParsedProviderCall } from './providers/types.js'
 
 // Bumped to 3 for the workspace-aware breakdown change: the cursor parser
@@ -31,12 +31,8 @@ type ResultCache = {
 
 const CACHE_FILE = 'cursor-results.json'
 
-function getCacheDir(): string {
-  return join(homedir(), '.cache', 'codeburn')
-}
-
 function getCachePath(): string {
-  return join(getCacheDir(), CACHE_FILE)
+  return join(getCodeburnCacheDir(), CACHE_FILE)
 }
 
 async function getDbFingerprint(dbPath: string): Promise<{ mtimeMs: number; size: number } | null> {
@@ -86,7 +82,7 @@ export async function writeCachedResults(
   const fp = await getDbFingerprint(dbPath)
   if (!fp) return
 
-  const dir = getCacheDir()
+  const dir = getCodeburnCacheDir()
   await mkdir(dir, { recursive: true }).catch(() => {})
   const cache: ResultCache = {
     version: CURSOR_CACHE_VERSION,

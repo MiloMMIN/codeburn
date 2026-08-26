@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import { basename } from 'path'
+import stripAnsi from 'strip-ansi'
 import { extractBashCommands, isReadShapedBashCommand } from '../src/bash-utils.js'
 import { BASH_TOOLS } from '../src/classifier.js'
 
@@ -116,6 +118,157 @@ describe('BASH_TOOLS', () => {
   it('recognizes Bash', () => { expect(BASH_TOOLS.has('Bash')).toBe(true) })
   it('recognizes BashTool', () => { expect(BASH_TOOLS.has('BashTool')).toBe(true) })
   it('rejects unknown tools', () => { expect(BASH_TOOLS.has('Read')).toBe(false) })
+})
+
+// Regression coverage for the quadratic -> linear separator-matching rewrite.
+// The old regex (/\s*(?:&&|;|\|)\s*/g, and the equivalent split form) is kept
+// here verbatim as a reference so new/old output can be diffed on tricky inputs.
+describe('separator regex fix: parity with pre-fix implementation', () => {
+  function stripQuotedStringsRef(command: string): string {
+    return command.replace(/"[^"]*"|'[^']*'/g, match => ' '.repeat(match.length))
+  }
+
+  const COMMAND_PREFIXES_REF = new Set([
+    'sudo', 'doas',
+    'npx', 'bunx',
+    'time',
+    'nice', 'nohup', 'stdbuf',
+    'rtk',
+  ])
+
+  const READ_ONLY_BASH_REF = new Set([
+    'rg', 'grep', 'egrep', 'fgrep', 'ag',
+    'cat', 'head', 'tail', 'less', 'more',
+    'ls', 'find', 'fd', 'tree',
+    'wc', 'stat', 'file', 'du', 'df',
+    'which', 'type', 'pwd', 'printenv', 'env',
+    'readlink', 'realpath', 'basename', 'dirname',
+    'jq', 'diff',
+  ])
+
+  const GIT_READ_SUBCOMMANDS_REF = new Set([
+    'log', 'diff', 'status', 'show', 'blame', 'grep',
+    'shortlog', 'describe', 'rev-parse', 'ls-files',
+  ])
+
+  function extractBashCommandsOld(rawCommand: string): string[] {
+    if (!rawCommand || !rawCommand.trim()) return []
+
+    const command = stripAnsi(rawCommand)
+    const stripped = stripQuotedStringsRef(command)
+
+    const separatorRegex = /\s*(?:&&|;|\|)\s*/g
+    const separators: Array<{ start: number; end: number }> = []
+    let match: RegExpExecArray | null
+
+    while ((match = separatorRegex.exec(stripped)) !== null) {
+      separators.push({ start: match.index, end: match.index + match[0].length })
+    }
+
+    const ranges: Array<[number, number]> = []
+    let cursor = 0
+    for (const sep of separators) {
+      ranges.push([cursor, sep.start])
+      cursor = sep.end
+    }
+    ranges.push([cursor, command.length])
+
+    const commands: string[] = []
+    for (const [start, end] of ranges) {
+      const segment = command.slice(start, end).trim()
+      if (!segment) continue
+
+      const tokens = segment.split(/\s+/)
+      let i = 0
+      while (i < tokens.length) {
+        if (/^\w+=/.test(tokens[i]!)) { i++; continue }
+        const next = tokens[i + 1]
+        if (
+          next !== undefined &&
+          COMMAND_PREFIXES_REF.has(basename(tokens[i]!)) &&
+          !next.startsWith('-') &&
+          !/["']/.test(next)
+        ) { i++; continue }
+        break
+      }
+      const base = i < tokens.length ? basename(tokens[i]!) : ''
+
+      if (base && base !== 'cd' && base !== 'true' && base !== 'false') {
+        commands.push(base)
+      }
+    }
+
+    return commands
+  }
+
+  function isReadShapedBashCommandOld(rawCommand: string): boolean {
+    if (!rawCommand || !rawCommand.trim()) return false
+    const stripped = stripQuotedStringsRef(stripAnsi(rawCommand))
+    const segments = stripped.split(/\s*(?:&&|;|\|)\s*/)
+    let sawCommand = false
+    for (const segment of segments) {
+      const trimmed = segment.trim()
+      if (!trimmed) continue
+      const tokens = trimmed.split(/\s+/)
+      let i = 0
+      while (i < tokens.length && (/^\w+=/.test(tokens[i]!) || COMMAND_PREFIXES_REF.has(basename(tokens[i]!)))) i++
+      const base = i < tokens.length ? basename(tokens[i]!) : ''
+      if (!base) continue
+      sawCommand = true
+      if (base === 'git') {
+        const sub = tokens[i + 1]
+        if (!sub || !GIT_READ_SUBCOMMANDS_REF.has(sub)) return false
+        continue
+      }
+      if (!READ_ONLY_BASH_REF.has(base)) return false
+    }
+    return sawCommand
+  }
+
+  function buildWhitespaceHeavyCommand(): string {
+    const parts: string[] = []
+    for (let i = 0; i < 10; i++) parts.push('git' + ' '.repeat(2000) + 'status')
+    return parts.join(' && ')
+  }
+
+  const TRICKY_INPUTS: string[] = [
+    'echo "a && b" && ls',
+    "foo 'x;y';bar",
+    'cat <<EOF\n   some     text   with     lots   of   whitespace   \n\n\nEOF\n   &&   ls -la',
+    'echo a\r\n&&\tls',
+    'foo\t;\tbar',
+    'a ; ; b',
+    'a|b',
+    '&& ls',
+    'ls &&',
+    '; ls ;',
+    buildWhitespaceHeavyCommand(),
+    'echo a && ls',
+    'foo ; bar',
+    '',
+    '   ',
+    '[31mls[0m && [32mpwd[0m',
+    '[31mgit[0m status',
+  ]
+
+  it('extractBashCommands matches the old implementation across tricky separator inputs', () => {
+    for (const input of TRICKY_INPUTS) {
+      expect(extractBashCommands(input)).toEqual(extractBashCommandsOld(input))
+    }
+  })
+
+  it('isReadShapedBashCommand matches the old implementation across tricky separator inputs', () => {
+    for (const input of TRICKY_INPUTS) {
+      expect(isReadShapedBashCommand(input)).toBe(isReadShapedBashCommandOld(input))
+    }
+  })
+
+  it('runs the whitespace-heavy command in well under 50ms (old form is quadratic)', () => {
+    const big = buildWhitespaceHeavyCommand()
+    const t0 = Date.now()
+    extractBashCommands(big)
+    expect(Date.now() - t0).toBeLessThan(50)
+  })
 })
 
 describe('isReadShapedBashCommand (#941)', () => {

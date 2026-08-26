@@ -18,6 +18,7 @@ For the architectural picture, see `../architecture.md`.
 | [Copilot](copilot.md) | JSONL + SQLite (OTel) + Nitrite .db (JetBrains) | `src/providers/copilot.ts` | `tests/providers/copilot.test.ts` |
 | [Devin](devin.md) | JSON + SQLite enrichment | `src/providers/devin.ts` | `tests/providers/devin.test.ts` |
 | [Droid](droid.md) | JSONL | `src/providers/droid.ts` | `tests/providers/droid.test.ts` |
+| [DeepSeek Harness](dsh.md) | JSONL (zstd frames) | `src/providers/dsh.ts` | `tests/providers/dsh.test.ts` |
 | [Gemini](gemini.md) | JSON / JSONL | `src/providers/gemini.ts` | none |
 | [Hermes Agent](hermes.md) | SQLite | `src/providers/hermes.ts` | `tests/providers/hermes.test.ts` |
 | [IBM Bob](ibm-bob.md) | JSON | `src/providers/ibm-bob.ts` | `tests/providers/ibm-bob.test.ts` |

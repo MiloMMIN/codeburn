@@ -11,6 +11,7 @@
 //   build/cli/package.json          (root package.json: {version}, type:module)
 //   build/cli/dist/cli.js           (Node-version-guard launcher → ./main.js)
 //   build/cli/dist/main.js          (the bundle)
+//   build/cli/dist/parse-worker.js  (the parse worker thread's own entry)
 //   build/cli/node_modules/         (production dependency closure)
 //
 // The production closure is copied out of the already-installed root
@@ -29,7 +30,7 @@ const dist = join(root, 'dist')
 const rootModules = join(root, 'node_modules')
 const stage = join(appDir, 'build', 'cli')
 
-for (const f of ['cli.js', 'main.js']) {
+for (const f of ['cli.js', 'main.js', 'parse-worker.js']) {
   if (!existsSync(join(dist, f))) {
     throw new Error(`stage-cli: ${join(dist, f)} is missing — build the root CLI first`)
   }
@@ -41,6 +42,10 @@ mkdirSync(join(stage, 'dist'), { recursive: true })
 copyFileSync(join(root, 'package.json'), join(stage, 'package.json'))
 copyFileSync(join(dist, 'cli.js'), join(stage, 'dist', 'cli.js'))
 copyFileSync(join(dist, 'main.js'), join(stage, 'dist', 'main.js'))
+// The cold-parse worker pool resolves this as a sibling of the bundle it runs
+// from, so it has to be staged alongside main.js or a packaged app silently
+// loses every parse thread.
+copyFileSync(join(dist, 'parse-worker.js'), join(stage, 'dist', 'parse-worker.js'))
 
 // Desktop-app launch shim (the app spawns this, not cli.js). The packaged app
 // runs the CLI with Electron's own binary as Node (ELECTRON_RUN_AS_NODE=1).

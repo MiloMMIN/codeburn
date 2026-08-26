@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-  entry: ['src/main.ts'],
+  entry: ['src/main.ts', 'src/parse-worker.ts'],
   format: ['esm'],
   target: 'node20',
   outDir: 'dist',

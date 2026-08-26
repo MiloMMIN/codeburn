@@ -1,6 +1,8 @@
 import { basename } from 'path'
 import stripAnsi from 'strip-ansi'
 
+const WHITESPACE = /\s/
+
 function stripQuotedStrings(command: string): string {
   return command.replace(/"[^"]*"|'[^']*'/g, match => ' '.repeat(match.length))
 }
@@ -19,12 +21,22 @@ export function extractBashCommands(rawCommand: string): string[] {
   const command = stripAnsi(rawCommand)
   const stripped = stripQuotedStrings(command)
 
-  const separatorRegex = /\s*(?:&&|;|\|)\s*/g
+  // Match the separator alone, then widen over surrounding whitespace by hand.
+  // /\s*(?:&&|;|\|)\s*/ retried its leading \s* from every offset, quadratic on
+  // long whitespace-heavy commands. Widening is required (not cosmetic): stripQuotedStrings
+  // blanks quoted text, and segments are sliced from the original string.
+  const separatorRegex = /(?:&&|;|\|)/g
   const separators: Array<{ start: number; end: number }> = []
   let match: RegExpExecArray | null
 
   while ((match = separatorRegex.exec(stripped)) !== null) {
-    separators.push({ start: match.index, end: match.index + match[0].length })
+    let start = match.index
+    while (start > 0 && WHITESPACE.test(stripped[start - 1]!)) start--
+    let end = match.index + match[0].length
+    while (end < stripped.length && WHITESPACE.test(stripped[end]!)) end++
+    const prevEnd = separators[separators.length - 1]?.end ?? 0
+    separators.push({ start: Math.max(start, prevEnd), end })
+    separatorRegex.lastIndex = end
   }
 
   const ranges: Array<[number, number]> = []
@@ -93,7 +105,7 @@ const GIT_READ_SUBCOMMANDS = new Set([
 export function isReadShapedBashCommand(rawCommand: string): boolean {
   if (!rawCommand || !rawCommand.trim()) return false
   const stripped = stripQuotedStrings(stripAnsi(rawCommand))
-  const segments = stripped.split(/\s*(?:&&|;|\|)\s*/)
+  const segments = stripped.split(/(?:&&|;|\|)/)
   let sawCommand = false
   for (const segment of segments) {
     const trimmed = segment.trim()

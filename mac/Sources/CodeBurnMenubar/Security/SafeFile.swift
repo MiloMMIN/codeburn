@@ -2,7 +2,7 @@ import Foundation
 
 /// Symlink-safe file I/O with atomic writes and optional cross-process flock.
 ///
-/// Every cache file we touch (`~/Library/Caches/codeburn-mac/fx-rates.json`,
+/// Every cache file we touch (`~/.cache/codeburn/fx-rates.json`,
 /// `~/.cache/codeburn/subscription-snapshots.json`, `~/.config/codeburn/config.json`) is a
 /// legitimate target for a local-symlink attack: if an attacker plants a symlink from one of
 /// those paths to, say, `~/.ssh/config`, a naive `Data.write(to:)` blindly follows the link and

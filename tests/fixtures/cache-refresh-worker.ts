@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
 
 import { acquireCacheRefreshLock } from '../../src/cache-refresh-lock.js'
-import { loadCache, saveCache } from '../../src/session-cache.js'
+import { loadCache, markCacheDirty, saveCache } from '../../src/session-cache.js'
 
 const [cacheDir, barrierDir, id, sourcePath, bypass = 'false'] = process.argv.slice(2)
 if (!cacheDir || !barrierDir || !id || !sourcePath) throw new Error('missing worker argument')
@@ -33,7 +33,7 @@ try {
     mcpInventory: [],
     turns: [],
   }
-  ;(cache as { _dirty?: boolean })._dirty = true
+  markCacheDirty(cache, 'regression')
   await writeFile(join(barrierDir, `${id}.parsed`), '')
   await waitFor(`${id}.save`)
   const published = await saveCache(cache, refresh?.handle.verifyStillOwner)

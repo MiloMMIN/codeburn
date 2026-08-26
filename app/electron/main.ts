@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 
-import { CliError, killAll, resolveCodeburnPath, spawnCli, spawnCliAction, startServeWarmup, type ActionResult, type SpawnPriority } from './cli'
+import { CliError, DESKTOP_COLD_TIMEOUT_MS, resolveCodeburnPath, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
@@ -77,7 +77,7 @@ export type Envelope<T = unknown> = { ok: true; value: T } | { ok: false; error:
 // slowness. Give the first (cold) overview a long window; revert to the default
 // once it succeeds. Sections gate their own first poll on this one resolving so
 // the cold hydration runs ONCE, not once per section in parallel.
-const WARMUP_TIMEOUT_MS = 10 * 60_000
+const WARMUP_TIMEOUT_MS = DESKTOP_COLD_TIMEOUT_MS
 // Wire marker for CLI scan-progress lines (src/parser.ts: PROGRESS_LINE_PREFIX).
 const PROGRESS_LINE_PREFIX = 'CODEBURN_PROGRESS '
 // IPC channel carrying cold-start scan-progress events to the splash.
@@ -564,15 +564,15 @@ function bootstrap(): void {
 
   app.on('before-quit', createBeforeQuitHandler({
     getTelemetry: () => telemetryInstance,
-    killAll,
+    killAll: shutdownAll,
     quit: () => app.quit(),
   }))
 
   void app.whenReady().then(() => {
-    // Start the resident serve child early so its warm-up (one cache parse)
-    // finishes during the first panels' cold spawns; every fetch after that
-    // answers from the warm child in milliseconds.
-    startServeWarmup()
+    // Start the resident child early, but issue no artificial warm-up query:
+    // the first real overview request is the single cache hydration and streams
+    // its progress through serve. Every later panel reuses that parsed cache.
+    startServe()
     // Consent-gated anonymous telemetry (desktop only). Nothing transmits until
     // the onboarding consent screen is completed and the toggle is on; EU/EEA/
     // UK/CH installs default the toggle off. Dev builds never send.

@@ -8,7 +8,7 @@ vi.mock('../src/cache-refresh-lock.js', () => ({
 }))
 
 import { clearSessionCache, isSessionHydrationComplete, parseAllSessions } from '../src/parser.js'
-import { sessionCachePath } from '../src/session-cache.js'
+import { cacheDirSnapshot } from './fixtures/session-cache-io.js'
 
 let root: string
 let sessionPath: string
@@ -52,12 +52,12 @@ describe('parseAllSessions warm refresh timeout', () => {
   it('serves the prior complete snapshot and leaves the holder cache untouched', async () => {
     await writeSession(50)
     expect(output(await parseAllSessions(undefined, 'claude'))).toBe(50)
-    const before = await readFile(sessionCachePath(), 'utf-8')
+    const before = await cacheDirSnapshot()
 
     await writeSession(5000)
     clearSessionCache()
     expect(output(await parseAllSessions(undefined, 'claude'))).toBe(50)
-    expect(await readFile(sessionCachePath(), 'utf-8')).toBe(before)
+    expect(await cacheDirSnapshot()).toBe(before)
   })
 
   // The snapshot a timed-out refresh serves is only as good as what has changed

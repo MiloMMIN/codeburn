@@ -2,7 +2,7 @@
  * Unit tests for sync ledger and OTLP payload builder.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtemp, rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
@@ -233,17 +233,21 @@ describe('batchCalls', () => {
 describe('ledger', () => {
   let tmpDir: string
   const originalHome = process.env.HOME
+  const originalCacheDir = process.env.CODEBURN_CACHE_DIR
+  const originalXdgCacheDir = process.env.XDG_CACHE_HOME
 
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'codeburn-ledger-'))
     process.env.HOME = tmpDir
-    // env-isolation.ts redirects XDG_CACHE_HOME to a per-worker sandbox shared
-    // across tests — the ledger honors XDG, so point it at the per-test dir.
-    process.env.XDG_CACHE_HOME = join(tmpDir, '.cache')
+    process.env.CODEBURN_CACHE_DIR = join(tmpDir, '.cache', 'codeburn')
   })
 
   afterEach(async () => {
     process.env.HOME = originalHome
+    if (originalCacheDir === undefined) delete process.env.CODEBURN_CACHE_DIR
+    else process.env.CODEBURN_CACHE_DIR = originalCacheDir
+    if (originalXdgCacheDir === undefined) delete process.env.XDG_CACHE_HOME
+    else process.env.XDG_CACHE_HOME = originalXdgCacheDir
     await rm(tmpDir, { recursive: true, force: true })
   })
 
@@ -308,6 +312,91 @@ describe('ledger', () => {
     expect(clearLedger()).toBe(0)
   })
 
+  it('clearLedger removes coexisting canonical and eligible legacy ledgers without adopting either', async () => {
+    const { clearLedger } = await import('../src/sync/ledger.js')
+    const { existsSync, mkdirSync, writeFileSync } = await import('fs')
+    const canonicalDir = join(tmpDir, '.cache', 'codeburn')
+    const xdgDir = join(tmpDir, 'xdg-clear-coexisting')
+    const legacyDir = join(xdgDir, 'codeburn')
+
+    delete process.env.CODEBURN_CACHE_DIR
+    process.env.XDG_CACHE_HOME = xdgDir
+    mkdirSync(canonicalDir, { recursive: true })
+    mkdirSync(legacyDir, { recursive: true })
+    writeFileSync(join(canonicalDir, 'sync-ledger.json'), JSON.stringify([
+      { key: 'canonical', ts: '2026-07-02T00:00:00Z' },
+      { key: 'duplicate', ts: '2026-07-03T00:00:00Z' },
+    ]))
+    writeFileSync(join(legacyDir, 'sync-ledger.json'), JSON.stringify([
+      { key: 'legacy', ts: '2026-07-01T00:00:00Z' },
+      { key: 'duplicate', ts: '2025-01-01T00:00:00Z' },
+    ]))
+
+    expect(clearLedger()).toBe(3)
+    expect(existsSync(join(canonicalDir, 'sync-ledger.json'))).toBe(false)
+    expect(existsSync(join(legacyDir, 'sync-ledger.json'))).toBe(false)
+  })
+
+  it('clearLedger attempts both targets, reports a real unlink failure, and can retry the remainder', async () => {
+    const fs = await import('fs')
+    const canonicalDir = join(tmpDir, '.cache', 'codeburn')
+    const canonicalPath = join(canonicalDir, 'sync-ledger.json')
+    const xdgDir = join(tmpDir, 'xdg-clear-retry')
+    const legacyDir = join(xdgDir, 'codeburn')
+    const legacyPath = join(legacyDir, 'sync-ledger.json')
+
+    delete process.env.CODEBURN_CACHE_DIR
+    process.env.XDG_CACHE_HOME = xdgDir
+    fs.mkdirSync(canonicalDir, { recursive: true })
+    fs.mkdirSync(legacyDir, { recursive: true })
+    fs.writeFileSync(canonicalPath, JSON.stringify([
+      { key: 'canonical', ts: '2026-07-02T00:00:00Z' },
+    ]))
+    fs.writeFileSync(legacyPath, JSON.stringify([
+      { key: 'legacy', ts: '2026-07-01T00:00:00Z' },
+    ]))
+
+    const attempts: string[] = []
+    let failCanonicalOnce = true
+    vi.doMock('fs', async () => {
+      const actual = await vi.importActual<typeof import('fs')>('fs')
+      return {
+        ...actual,
+        unlinkSync: (path: fs.PathLike) => {
+          const value = String(path)
+          attempts.push(value)
+          if (value === canonicalPath && failCanonicalOnce) {
+            failCanonicalOnce = false
+            throw Object.assign(new Error('injected canonical unlink failure'), { code: 'EACCES' })
+          }
+          return actual.unlinkSync(path)
+        },
+      }
+    })
+    vi.resetModules()
+
+    try {
+      const { clearLedger } = await import('../src/sync/ledger.js')
+      expect(() => clearLedger()).toThrow('injected canonical unlink failure')
+      expect(attempts).toContain(canonicalPath)
+      expect(attempts).toContain(legacyPath)
+      expect(fs.existsSync(canonicalPath)).toBe(true)
+      expect(fs.existsSync(legacyPath)).toBe(false)
+      expect(JSON.parse(fs.readFileSync(canonicalPath, 'utf8'))).toEqual([
+        { key: 'canonical', ts: '2026-07-02T00:00:00Z' },
+      ])
+
+      // The successful legacy deletion is not replayed or migrated. Retrying
+      // removes only the canonical remainder; its missing peer is ENOENT-safe.
+      expect(clearLedger()).toBe(1)
+      expect(fs.existsSync(canonicalPath)).toBe(false)
+      expect(fs.existsSync(legacyPath)).toBe(false)
+    } finally {
+      vi.doUnmock('fs')
+      vi.resetModules()
+    }
+  })
+
   it('corrupt ledger file reads as empty (crash-safe recovery)', async () => {
     const { readLedger } = await import('../src/sync/ledger.js')
     const { mkdirSync, writeFileSync } = await import('fs')
@@ -328,21 +417,168 @@ describe('ledger', () => {
     expect(existsSync(join(dir, 'sync-ledger.json.tmp'))).toBe(false)
   })
 
-  it('honors XDG_CACHE_HOME when set', async () => {
+  it('honors CODEBURN_CACHE_DIR at call time', async () => {
     const { writeLedger, readLedger } = await import('../src/sync/ledger.js')
     const { existsSync } = await import('fs')
     const { join } = await import('path')
-    const xdgDir = join(process.env.HOME!, 'xdg-cache')
-    const original = process.env.XDG_CACHE_HOME
+    const firstDir = join(tmpDir, 'cache-a')
+    const secondDir = join(tmpDir, 'cache-b')
+
+    process.env.CODEBURN_CACHE_DIR = firstDir
+    writeLedger([{ key: 'first', ts: '2026-07-01T00:00:00Z' }])
+    process.env.CODEBURN_CACHE_DIR = secondDir
+    writeLedger([{ key: 'second', ts: '2026-07-02T00:00:00Z' }])
+
+    expect(existsSync(join(firstDir, 'sync-ledger.json'))).toBe(true)
+    expect(existsSync(join(secondDir, 'sync-ledger.json'))).toBe(true)
+    expect(readLedger().map(e => e.key)).toEqual(['second'])
+
+    process.env.CODEBURN_CACHE_DIR = firstDir
+    expect(readLedger().map(e => e.key)).toEqual(['first'])
+  })
+
+  it('uses the shared default when both overrides are explicitly absent', async () => {
+    const { writeLedger } = await import('../src/sync/ledger.js')
+    const { existsSync } = await import('fs')
+    const { join } = await import('path')
+
+    delete process.env.CODEBURN_CACHE_DIR
+    delete process.env.XDG_CACHE_HOME
+    writeLedger([{ key: 'default', ts: '2026-07-01T00:00:00Z' }])
+
+    expect(existsSync(join(tmpDir, '.cache', 'codeburn', 'sync-ledger.json'))).toBe(true)
+  })
+
+  it('adopts an XDG-only legacy ledger into the canonical default and writes there thereafter', async () => {
+    const { appendToLedger, readLedger } = await import('../src/sync/ledger.js')
+    const { existsSync, mkdirSync, readFileSync, writeFileSync } = await import('fs')
+    const { join } = await import('path')
+    const xdgDir = join(tmpDir, 'xdg-cache')
+    const legacyDir = join(xdgDir, 'codeburn')
+    const canonicalDir = join(tmpDir, '.cache', 'codeburn')
+
+    delete process.env.CODEBURN_CACHE_DIR
     process.env.XDG_CACHE_HOME = xdgDir
-    try {
-      writeLedger([{ key: 'xdg-entry', ts: '2026-07-01T00:00:00Z' }])
-      expect(existsSync(join(xdgDir, 'codeburn', 'sync-ledger.json'))).toBe(true)
-      expect(readLedger().map(e => e.key)).toEqual(['xdg-entry'])
-    } finally {
-      if (original === undefined) delete process.env.XDG_CACHE_HOME
-      else process.env.XDG_CACHE_HOME = original
-    }
+    mkdirSync(legacyDir, { recursive: true })
+    writeFileSync(join(legacyDir, 'sync-ledger.json'), JSON.stringify([
+      { key: 'legacy', ts: '2026-07-01T00:00:00Z' },
+    ]))
+
+    expect(readLedger().map(entry => entry.key)).toEqual(['legacy'])
+    expect(existsSync(join(canonicalDir, 'sync-ledger.json'))).toBe(true)
+    expect(existsSync(join(legacyDir, 'sync-ledger.json'))).toBe(false)
+
+    appendToLedger([{ key: 'canonical', ts: '2026-07-02T00:00:00Z' }])
+    expect(JSON.parse(readFileSync(join(canonicalDir, 'sync-ledger.json'), 'utf8')).map((entry: { key: string }) => entry.key)).toEqual([
+      'legacy',
+      'canonical',
+    ])
+    expect(existsSync(join(legacyDir, 'sync-ledger.json'))).toBe(false)
+  })
+
+  it('does not adopt a legacy XDG ledger when CODEBURN_CACHE_DIR is explicitly set', async () => {
+    const { readLedger, writeLedger } = await import('../src/sync/ledger.js')
+    const { existsSync, mkdirSync, writeFileSync } = await import('fs')
+    const explicitDir = join(tmpDir, 'explicit-cache-precedence')
+    const xdgDir = join(tmpDir, 'xdg-cache-precedence')
+    const legacyDir = join(xdgDir, 'codeburn')
+
+    process.env.CODEBURN_CACHE_DIR = explicitDir
+    process.env.XDG_CACHE_HOME = xdgDir
+    mkdirSync(legacyDir, { recursive: true })
+    writeFileSync(join(legacyDir, 'sync-ledger.json'), JSON.stringify([
+      { key: 'legacy', ts: '2026-07-01T00:00:00Z' },
+    ]))
+
+    expect(readLedger()).toEqual([])
+    writeLedger([{ key: 'explicit', ts: '2026-07-02T00:00:00Z' }])
+
+    expect(readLedger().map(entry => entry.key)).toEqual(['explicit'])
+    expect(existsSync(join(explicitDir, 'sync-ledger.json'))).toBe(true)
+    expect(existsSync(join(legacyDir, 'sync-ledger.json'))).toBe(true)
+  })
+
+  it('merges an XDG legacy ledger into an existing canonical ledger once', async () => {
+    const { readLedger } = await import('../src/sync/ledger.js')
+    const { existsSync, mkdirSync, writeFileSync } = await import('fs')
+    const canonicalDir = join(tmpDir, '.cache', 'codeburn')
+    const xdgDir = join(tmpDir, 'xdg-cache-merge')
+    const legacyDir = join(xdgDir, 'codeburn')
+
+    delete process.env.CODEBURN_CACHE_DIR
+    process.env.XDG_CACHE_HOME = xdgDir
+    mkdirSync(canonicalDir, { recursive: true })
+    mkdirSync(legacyDir, { recursive: true })
+    writeFileSync(join(canonicalDir, 'sync-ledger.json'), JSON.stringify([
+      { key: 'canonical', ts: '2026-07-02T00:00:00Z' },
+      { key: 'duplicate', ts: '2026-07-03T00:00:00Z' },
+    ]))
+    writeFileSync(join(legacyDir, 'sync-ledger.json'), JSON.stringify([
+      { key: 'legacy', ts: '2026-07-01T00:00:00Z' },
+      { key: 'duplicate', ts: '2025-01-01T00:00:00Z' },
+    ]))
+
+    expect(readLedger()).toEqual([
+      { key: 'canonical', ts: '2026-07-02T00:00:00Z' },
+      { key: 'duplicate', ts: '2026-07-03T00:00:00Z' },
+      { key: 'legacy', ts: '2026-07-01T00:00:00Z' },
+    ])
+    expect(existsSync(join(legacyDir, 'sync-ledger.json'))).toBe(false)
+    // A later read is canonical-only and stable; XDG is no longer active.
+    expect(readLedger().map(entry => entry.key)).toEqual(['canonical', 'duplicate', 'legacy'])
+  })
+
+  it('prefers non-empty CODEBURN_CACHE_DIR over XDG_CACHE_HOME', async () => {
+    const { writeLedger } = await import('../src/sync/ledger.js')
+    const { existsSync } = await import('fs')
+    const { join } = await import('path')
+    const explicitDir = join(tmpDir, 'explicit-cache')
+    const xdgDir = join(tmpDir, 'xdg-cache')
+
+    process.env.CODEBURN_CACHE_DIR = explicitDir
+    process.env.XDG_CACHE_HOME = xdgDir
+    writeLedger([{ key: 'explicit', ts: '2026-07-01T00:00:00Z' }])
+
+    expect(existsSync(join(explicitDir, 'sync-ledger.json'))).toBe(true)
+    expect(existsSync(join(xdgDir, 'codeburn', 'sync-ledger.json'))).toBe(false)
+  })
+
+  it.each(['', '   '])('ignores empty CODEBURN_CACHE_DIR %j and writes to the canonical default', async explicit => {
+    const { writeLedger } = await import('../src/sync/ledger.js')
+    const { existsSync } = await import('fs')
+    const { join } = await import('path')
+    const xdgDir = join(tmpDir, `xdg-cache-${explicit.length}`)
+
+    process.env.CODEBURN_CACHE_DIR = explicit
+    process.env.XDG_CACHE_HOME = xdgDir
+    writeLedger([{ key: 'xdg-fallback', ts: '2026-07-01T00:00:00Z' }])
+
+    expect(existsSync(join(tmpDir, '.cache', 'codeburn', 'sync-ledger.json'))).toBe(true)
+    expect(existsSync(join(xdgDir, 'codeburn', 'sync-ledger.json'))).toBe(false)
+  })
+
+  it.each(['', '   '])('ignores empty XDG_CACHE_HOME %j and uses the shared default', async xdg => {
+    const { writeLedger } = await import('../src/sync/ledger.js')
+    const { existsSync } = await import('fs')
+    const { join } = await import('path')
+
+    delete process.env.CODEBURN_CACHE_DIR
+    process.env.XDG_CACHE_HOME = xdg
+    writeLedger([{ key: 'default-fallback', ts: '2026-07-01T00:00:00Z' }])
+
+    expect(existsSync(join(tmpDir, '.cache', 'codeburn', 'sync-ledger.json'))).toBe(true)
+  })
+
+  it.each(['', '   '])('uses the shared default when both overrides are empty and CODEBURN is %j', async explicit => {
+    const { writeLedger } = await import('../src/sync/ledger.js')
+    const { existsSync } = await import('fs')
+    const { join } = await import('path')
+
+    process.env.CODEBURN_CACHE_DIR = explicit
+    process.env.XDG_CACHE_HOME = '   '
+    writeLedger([{ key: 'default-fallback', ts: '2026-07-01T00:00:00Z' }])
+
+    expect(existsSync(join(tmpDir, '.cache', 'codeburn', 'sync-ledger.json'))).toBe(true)
   })
 })
 

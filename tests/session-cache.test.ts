@@ -21,11 +21,12 @@ import {
   mergeCallByDedupKey,
   reconcileFile,
   saveCache,
-  sessionCachePath,
+  sessionCacheDir,
 } from '../src/session-cache.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 
-// Version-suffixed filename (e.g. session-cache.v5.json) the cache now writes to.
-const CACHE_FILE = () => basename(sessionCachePath())
+// Version-suffixed directory (e.g. session-cache.v8) the cache now writes to.
+const CACHE_DIR = () => basename(sessionCacheDir())
 
 const TMP_DIR = join(tmpdir(), `codeburn-scache-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
 
@@ -185,8 +186,7 @@ describe('loadCache / saveCache', () => {
 
   it('atomic write does not leave partial file on error', async () => {
     await saveCache(emptyCache())
-    const raw = await readFile(sessionCachePath(), 'utf-8')
-    expect(JSON.parse(raw)).toEqual(emptyCache())
+    expect(await readCacheOnDisk()).toEqual(emptyCache())
   })
 })
 
@@ -196,14 +196,15 @@ describe('versioned cache file + legacy adoption', () => {
   function validCache(): SessionCache {
     return {
       version: CACHE_VERSION,
+      complete: false,
       providers: { claude: { envFingerprint: 'abc123', files: { '/path/to/session.jsonl': makeCachedFile() } } },
     }
   }
 
-  it('writes and reads the version-suffixed file, never the legacy name', async () => {
-    expect(basename(sessionCachePath())).toBe(`session-cache.v${CACHE_VERSION}.json`)
+  it('writes and reads the version-suffixed directory, never the legacy name', async () => {
+    expect(basename(sessionCacheDir())).toBe(`session-cache.v${CACHE_VERSION}`)
     await saveCache(validCache())
-    expect(existsSync(sessionCachePath())).toBe(true)
+    expect(existsSync(sessionCacheDir())).toBe(true)
     expect(existsSync(join(TMP_DIR, 'session-cache.json'))).toBe(false)
     expect(await loadCache()).toEqual(validCache())
   })
@@ -213,9 +214,9 @@ describe('versioned cache file + legacy adoption', () => {
     const legacy = join(TMP_DIR, 'session-cache.json')
     await writeFile(legacy, JSON.stringify(validCache()))
 
-    // Versioned file absent → adopt-copy from legacy on first load.
+    // Versioned directory absent → adopt-copy from legacy on first load.
     expect(await loadCache()).toEqual(validCache())
-    expect(existsSync(sessionCachePath())).toBe(true)
+    expect(existsSync(sessionCacheDir())).toBe(true)
     // Legacy left intact (not deleted, not rewritten).
     expect(existsSync(legacy)).toBe(true)
     expect(JSON.parse(await readFile(legacy, 'utf-8'))).toEqual(validCache())
@@ -224,7 +225,7 @@ describe('versioned cache file + legacy adoption', () => {
     // file exists.
     const mutated: SessionCache = { version: CACHE_VERSION, providers: { codex: { envFingerprint: 'zzz', files: {} } } }
     await writeFile(legacy, JSON.stringify(mutated))
-    expect(await loadCache()).toEqual(validCache())
+    expect(await readCacheOnDisk()).toEqual(validCache())
   })
 
   it('ignores a different-version legacy file and never touches it', async () => {
@@ -234,8 +235,8 @@ describe('versioned cache file + legacy adoption', () => {
     await writeFile(legacy, JSON.stringify(stale))
 
     expect((await loadCache()).providers).toEqual({})
-    // No versioned file adopted; legacy left byte-intact.
-    expect(existsSync(sessionCachePath())).toBe(false)
+    // No versioned directory adopted; legacy left byte-intact.
+    expect(existsSync(sessionCacheDir())).toBe(false)
     expect(JSON.parse(await readFile(legacy, 'utf-8'))).toEqual(stale)
   })
 
@@ -246,9 +247,9 @@ describe('versioned cache file + legacy adoption', () => {
     await writeFile(legacy, legacyContent)
 
     await saveCache(validCache())
-    // The versioned file holds the new data; the legacy file is byte-untouched.
+    // The shards hold the new data; the legacy file is byte-untouched.
     expect(await readFile(legacy, 'utf-8')).toBe(legacyContent)
-    expect(JSON.parse(await readFile(sessionCachePath(), 'utf-8'))).toEqual(validCache())
+    expect(await readCacheOnDisk()).toEqual(validCache())
   })
 })
 
@@ -820,7 +821,7 @@ describe('loadCache validation', () => {
       } } },
     }
     await writeRawCache(cache)
-    expect((await loadCache())).toEqual(cache)
+    expect(await loadCache()).toEqual(cache)
   })
 
   it('accepts a fully valid cache with all fields populated', async () => {
@@ -845,7 +846,8 @@ describe('cleanupOrphanedTempFiles', () => {
   it('removes .tmp files older than 5 minutes', async () => {
     await mkdir(TMP_DIR, { recursive: true })
 
-    const oldTmp = join(TMP_DIR, `${CACHE_FILE()}.abc123.tmp`)
+    await mkdir(join(TMP_DIR, CACHE_DIR()), { recursive: true })
+    const oldTmp = join(TMP_DIR, CACHE_DIR(), 'claude.abc123.json.tmp')
     await writeFile(oldTmp, 'stale')
     const { utimes } = await import('fs/promises')
     const oldTime = new Date(Date.now() - 10 * 60 * 1000)
@@ -858,7 +860,8 @@ describe('cleanupOrphanedTempFiles', () => {
   it('preserves recent .tmp files', async () => {
     await mkdir(TMP_DIR, { recursive: true })
 
-    const recentTmp = join(TMP_DIR, `${CACHE_FILE()}.def456.tmp`)
+    await mkdir(join(TMP_DIR, CACHE_DIR()), { recursive: true })
+    const recentTmp = join(TMP_DIR, CACHE_DIR(), 'claude.def456.json.tmp')
     await writeFile(recentTmp, 'recent')
 
     await cleanupOrphanedTempFiles()

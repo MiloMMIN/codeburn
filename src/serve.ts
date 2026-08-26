@@ -1,8 +1,11 @@
 import { watch, type FSWatcher } from 'fs'
-import { stat } from 'fs/promises'
+import { readFile, stat } from 'fs/promises'
+import { createHash } from 'crypto'
 import { createInterface } from 'readline'
 
 import type { Command } from 'commander'
+import { getConfigFilePath } from './config.js'
+import type { ParseReuseValidation } from './parser.js'
 
 // ---------------------------------------------------------------------------
 // codeburn serve --stdio: a resident query server for the desktop app.
@@ -28,16 +31,77 @@ import type { Command } from 'commander'
 //   already guards between processes.
 // ---------------------------------------------------------------------------
 
-// First-token allowlist of the app's heavy read queries. Deliberately absent:
-// every config mutation (currency, model-alias set, budget, price-override,
-// proxy-path, plan), export (writes files), share/devices (network + pairing
-// state), menubar/web/mcp/guard/sync/act (process management or writes).
 // Past this resident-set size the serve loop drops its in-memory memos and
 // re-parses on the next request. 3GB leaves generous room for the largest
 // observed corpora while bounding a pathological one.
 const SERVE_MAX_RSS_BYTES = 3 * 1024 * 1024 * 1024
 
-const SERVE_COMMANDS = new Set(['status', 'overview', 'models', 'sessions', 'compare', 'yield', 'spend', 'optimize', 'audit'])
+type OutputMemoEntry = {
+  createdAt: number
+  validatedFrom: number
+  output: string
+  configFingerprint: string
+}
+
+// Kept as a small seam so the ordering contract can be tested without relying
+// on filesystem watcher scheduling: an event arriving while a parse is in
+// flight must be newer than the memo produced by that parse.
+export function createOutputMemoEntry(
+  parseStartedAt: number,
+  parseCompletedAt: number,
+  output: string,
+  configFingerprint: string,
+): OutputMemoEntry {
+  return { createdAt: parseCompletedAt, validatedFrom: parseStartedAt, output, configFingerprint }
+}
+
+type ServeOptionKind = 'flag' | 'value'
+
+// This is intentionally a positive, command-specific option schema rather
+// than a shared denylist. If a command later gains a write-capable option it
+// remains a normal one-shot CLI action until it is explicitly reviewed here.
+// The entries mirror the Commander definitions in main.ts. In particular,
+// optimize omits its apply-only surface (--apply, --yes, --dry-run, --only).
+const SERVE_OPTIONS: Readonly<Record<string, Readonly<Record<string, ServeOptionKind>>>> = {
+  status: {
+    '--format': 'value', '--scope': 'value', '--provider': 'value', '--project': 'value',
+    '--exclude': 'value', '--period': 'value', '--day': 'value', '--from': 'value',
+    '--to': 'value', '--days': 'value', '--no-optimize': 'flag', '--no-timeline': 'flag',
+    '--claude-config-source': 'value',
+  },
+  overview: {
+    '-p': 'value', '--period': 'value', '--from': 'value', '--to': 'value',
+    '--provider': 'value', '--project': 'value', '--exclude': 'value', '--no-color': 'flag',
+  },
+  models: {
+    '-p': 'value', '--period': 'value', '--from': 'value', '--to': 'value',
+    '--provider': 'value', '--task': 'value', '--by-task': 'flag', '--by-agent': 'flag',
+    '--top': 'value', '--min-cost': 'value', '--no-totals': 'flag', '--format': 'value',
+  },
+  sessions: {
+    '-p': 'value', '--period': 'value', '--from': 'value', '--to': 'value',
+    '--provider': 'value', '--format': 'value', '--by-pr': 'flag', '--no-pager': 'flag',
+  },
+  compare: {
+    '-p': 'value', '--period': 'value', '--provider': 'value', '--format': 'value',
+    '--model-a': 'value', '--model-b': 'value',
+  },
+  yield: {
+    '-p': 'value', '--period': 'value', '--provider': 'value', '--format': 'value',
+  },
+  spend: {
+    '-p': 'value', '--period': 'value', '--from': 'value', '--to': 'value',
+    '--provider': 'value', '--format': 'value',
+  },
+  optimize: {
+    '-p': 'value', '--period': 'value', '--from': 'value', '--to': 'value',
+    '--provider': 'value', '--format': 'value', '--json': 'flag',
+  },
+  audit: {
+    '-p': 'value', '--period': 'value', '--from': 'value', '--to': 'value',
+    '--provider': 'value', '--format': 'value',
+  },
+}
 
 type ServeRequest = { id: string | number; args: string[] }
 
@@ -50,30 +114,73 @@ function isServeRequest(value: unknown): value is ServeRequest {
 
 function allowed(args: string[]): boolean {
   const first = args[0]
-  if (!first || !SERVE_COMMANDS.has(first)) return false
-  // No request may smuggle a second positional that turns a read into
-  // something else; the allowed commands take flags only.
-  return args.slice(1).every((a, i, all) => a.startsWith('-') || (i > 0 && all[i - 1]!.startsWith('--')))
+  if (!first) return false
+  const options = SERVE_OPTIONS[first]
+  if (!options) return false
+
+  // Served commands have no positional arguments. Long options may use the
+  // standard --name=value form; otherwise every value must immediately
+  // follow an option declared as value-bearing in that command's schema.
+  for (let i = 1; i < args.length; i++) {
+    const token = args[i]!
+    const separator = token.startsWith('--') ? token.indexOf('=') : -1
+    const option = separator >= 0 ? token.slice(0, separator) : token
+    const inlineValue = separator >= 0
+    const kind = options[option]
+    if (!kind) return false
+    if (kind === 'flag') {
+      if (inlineValue) return false
+      continue
+    }
+    if (inlineValue) continue
+    const value = args[++i]
+    if (value === undefined || value.startsWith('-')) return false
+  }
+  return true
 }
 
 class ExitSignal extends Error {
   constructor(public readonly code: number) { super(`exit ${code}`) }
 }
 
-/// Run one argv through a fresh program, capturing everything the command
-/// writes to stdout. process.exit inside a handler is converted to a thrown
-/// ExitSignal so a failing request can never take the server down.
-async function runCaptured(buildProgram: () => Command, args: string[]): Promise<{ output: string; code: number }> {
+function chunkToString(chunk: unknown, encoding: unknown): string {
+  if (typeof chunk === 'string') return chunk
+  if (chunk instanceof Uint8Array) {
+    return Buffer.from(chunk).toString(typeof encoding === 'string' ? encoding as BufferEncoding : 'utf8')
+  }
+  return String(chunk)
+}
+
+function finishWrite(rest: unknown[]): void {
+  const callback = rest[rest.length - 1]
+  if (typeof callback === 'function') (callback as () => void)()
+}
+
+/// Run one argv through a fresh program, capturing command stdout for the
+/// final response and forwarding command stderr as progress. process.exit
+/// inside a handler is converted to a thrown ExitSignal so a failing request
+/// can never take the server down.
+async function runCaptured(
+  buildProgram: () => Command,
+  args: string[],
+  onProgress: (progress: string) => void,
+): Promise<{ output: string; code: number }> {
   const chunks: string[] = []
   const originalWrite = process.stdout.write.bind(process.stdout)
+  const originalErrorWrite = process.stderr.write.bind(process.stderr)
   const originalExit = process.exit.bind(process)
 
   process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => {
-    chunks.push(typeof chunk === 'string' ? chunk : String(chunk))
-    const last = rest[rest.length - 1]
-    if (typeof last === 'function') (last as () => void)()
+    chunks.push(chunkToString(chunk, rest[0]))
+    finishWrite(rest)
     return true
   }) as typeof process.stdout.write
+  process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+    const progress = chunkToString(chunk, rest[0])
+    if (progress) onProgress(progress)
+    finishWrite(rest)
+    return true
+  }) as typeof process.stderr.write
   process.exit = ((code?: number) => { throw new ExitSignal(code ?? 0) }) as typeof process.exit
 
   try {
@@ -86,19 +193,57 @@ async function runCaptured(buildProgram: () => Command, args: string[]): Promise
     throw err
   } finally {
     process.stdout.write = originalWrite
+    process.stderr.write = originalErrorWrite
     process.exit = originalExit
+  }
+}
+
+/// A cheap per-request fingerprint for the configuration that affects query
+/// rendering and aggregation. Hashing the small config file tracks effective
+/// content rather than filesystem churn: a byte-identical rewrite keeps the
+/// memo hot, while any real change invalidates immediately. A missing config
+/// is a stable state; every other read failure fails closed (no memo reuse).
+async function getConfigFingerprint(): Promise<string | null> {
+  const path = getConfigFilePath()
+  try {
+    const content = await readFile(path)
+    const digest = createHash('sha256').update(content).digest('hex')
+    return `${path}\u0000sha256:${digest}`
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return `${path}\u0000missing`
+    return null
   }
 }
 
 /// Watch every provider's probe roots (the same paths codeburn doctor reports
 /// as "where discovery looks") so the parse-reuse validator can answer "did
 /// any session data change since T?" without a stat sweep. macOS fs.watch
-/// rides FSEvents and supports recursive directory watches; a root that fails
-/// to watch is simply not covered, which only shortens reuse (the burst
-/// window and the hard cap still apply), never staleness.
-async function startRootWatchers(): Promise<{ startedAt: number; lastEventAt: () => number; close: () => void }> {
+/// rides FSEvents and supports recursive directory watches. A probe failure or
+/// a watch failure for an existing root disables event-driven reuse for this
+/// generation; a root absent at setup is rechecked by the parser's hard cap.
+type RootWatcherState = {
+  startedAt: number
+  lastEventAt: () => number
+  healthy: () => boolean
+  close: () => void
+}
+
+export function classifyRootReuse(
+  sinceTs: number,
+  state: { startedAt: number; lastEventAt: number; healthy: boolean },
+): ParseReuseValidation {
+  // A known event is conclusive even if watcher coverage degraded afterward.
+  // Unknown means only that no dirty evidence exists and cleanliness cannot be
+  // established for the whole interval.
+  if (state.lastEventAt >= sinceTs) return 'dirty'
+  if (!state.healthy || sinceTs < state.startedAt) return 'unknown'
+  return 'clean'
+}
+
+async function startRootWatchers(): Promise<RootWatcherState | null> {
   let lastEventAt = 0
-  const startedAt = Date.now()
+  let healthy = true
+  let closed = false
   const watchers: FSWatcher[] = []
   try {
     const { getAllProviders } = await import('./providers/index.js')
@@ -108,21 +253,54 @@ async function startRootWatchers(): Promise<{ startedAt: number; lastEventAt: ()
       if (!provider.probeRoots) continue
       try {
         for (const root of await provider.probeRoots()) roots.add(root.path)
-      } catch { /* a failing probe just goes unwatched */ }
+      } catch {
+        // An unknown probe result could hide an existing input root, so no
+        // global all-roots-quiet claim is safe for this watcher generation.
+        healthy = false
+      }
     }
     for (const root of roots) {
+      let info: Awaited<ReturnType<typeof stat>>
       try {
-        const info = await stat(root)
+        info = await stat(root)
+      } catch (err) {
+        // An absent discovery root contains no sessions at arm time. If it is
+        // created later there is no child watcher to see that creation, so the
+        // parser's hard reuse cap remains the eventual revalidation backstop.
+        // Other stat failures mean an existing input could be uncovered.
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') healthy = false
+        continue
+      }
+      try {
         const watcher = watch(root, { recursive: info.isDirectory() }, () => { lastEventAt = Date.now() })
-        watcher.on('error', () => { /* dropped watcher = shorter reuse, never staleness */ })
+        watcher.on('error', () => { healthy = false })
         watchers.push(watcher)
-      } catch { /* nonexistent root: nothing to watch */ }
+      } catch {
+        // stat proved this input exists, so failing to arm it invalidates the
+        // global quiet predicate even when other roots remain watched.
+        healthy = false
+      }
     }
-  } catch { /* watcherless serve still works via the burst window */ }
+  } catch {
+    // Discovery itself failed. Existing watchers are still closed normally,
+    // but they cannot validate reuse for an incomplete root set.
+    healthy = false
+  }
+  if (watchers.length === 0) return null
+
+  // Coverage begins only after at least one watcher has been successfully
+  // armed. A parse performed while provider probing/stat/watch setup was in
+  // flight must not be blessed retroactively as watched.
+  const startedAt = Date.now()
   return {
     startedAt,
     lastEventAt: () => lastEventAt,
-    close: () => { for (const w of watchers) w.close() },
+    healthy: () => healthy && !closed,
+    close: () => {
+      if (closed) return
+      closed = true
+      for (const w of watchers) w.close()
+    },
   }
 }
 
@@ -136,27 +314,49 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   // parse stays valid past the burst window (capped in parser.ts, so a missed
   // filesystem event self-heals within minutes). This is what turns a warm
   // no-change fetch into a no-op instead of a stat sweep.
-  let rootsQuietSince: ((sinceTs: number) => boolean) | null = null
-  void startRootWatchers().then(async (w) => {
+  let rootReuseValidation: ((sinceTs: number) => ParseReuseValidation) | null = null
+  // Mutable object properties keep cleanup visible to TypeScript even though
+  // setup assigns them from an asynchronous continuation.
+  const watcherLifecycle: {
+    state: RootWatcherState | null
+    resetValidator: (() => void) | null
+  } = { state: null, resetValidator: null }
+  const watcherSetup = startRootWatchers().then(async (w) => {
+    watcherLifecycle.state = w
+    if (!w) return
     const { setParseReuseValidator } = await import('./parser.js')
     // Clean means: the watchers were already armed when the parse happened,
     // and no filesystem event has landed since. lastEventAt of 0 is a quiet
     // system (clean for anything parsed after arming), not an unknown.
-    const quiet = (sinceTs: number): boolean => sinceTs >= w.startedAt && w.lastEventAt() < sinceTs
-    rootsQuietSince = quiet
-    setParseReuseValidator(quiet)
-  }).catch(() => { /* watcherless serve still works via the burst window */ })
+    const validate = (sinceTs: number): ParseReuseValidation => classifyRootReuse(sinceTs, {
+      startedAt: w.startedAt,
+      lastEventAt: w.lastEventAt(),
+      healthy: w.healthy(),
+    })
+    rootReuseValidation = validate
+    setParseReuseValidator(validate)
+    watcherLifecycle.resetValidator = () => setParseReuseValidator(null)
+  }).catch(() => {
+    watcherLifecycle.state?.close()
+    watcherLifecycle.state = null
+  })
 
   // Output-level memo: an identical panel query while the roots are quiet
   // returns the previous stdout verbatim - the aggregation work is skipped
-  // too, not just the parse. Invalidation is the same event-or-cap rule the
-  // parse reuse uses.
+  // too, not just the parse. Session data uses the same event-or-cap rule as
+  // parse reuse; config.json is fingerprinted on every request because it can
+  // change rendering without touching a provider root.
   const OUTPUT_MEMO_CAP_MS = 5 * 60 * 1000
-  const outputMemo = new Map<string, { at: number; output: string }>()
+  const outputMemo = new Map<string, OutputMemoEntry>()
+  let observedConfigFingerprint: string | null | undefined
   if (process.stdin.isTTY) {
     process.stderr.write('codeburn serve speaks JSON over stdio and exists for the desktop app to hold warm.\nNothing interactive happens here; press Ctrl+C to exit.\n')
   }
-  const write = (value: unknown): void => { process.stdout.write(JSON.stringify(value) + '\n') }
+  // Keep the protocol transport anchored to the real stdout. runCaptured()
+  // temporarily replaces process.stdout.write to collect command output; a
+  // dynamic lookup here would swallow progress frames into the final payload.
+  const protocolWrite = process.stdout.write.bind(process.stdout)
+  const write = (value: unknown): void => { protocolWrite(JSON.stringify(value) + '\n') }
   write({ ready: true, pid: process.pid })
 
   // Strict serialization: each request chains on the previous one.
@@ -183,18 +383,39 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         write({ id: request.id, ok: false, refused: true, error: 'command not served' })
         return
       }
+      const configFingerprint = await getConfigFingerprint()
+      if (observedConfigFingerprint !== undefined && configFingerprint !== observedConfigFingerprint) {
+        outputMemo.clear()
+      }
+      observedConfigFingerprint = configFingerprint
+      // A permission or transient read failure must shorten reuse, never make
+      // an old result look current.
+      if (configFingerprint === null) outputMemo.clear()
+
       const memoKey = request.args.join('\u0000')
       const memoHit = outputMemo.get(memoKey)
-      if (memoHit && Date.now() - memoHit.at < OUTPUT_MEMO_CAP_MS && rootsQuietSince?.(memoHit.at)) {
+      if (
+        configFingerprint !== null
+        && memoHit?.configFingerprint === configFingerprint
+        && Date.now() - memoHit.createdAt < OUTPUT_MEMO_CAP_MS
+        && rootReuseValidation?.(memoHit.validatedFrom) === 'clean'
+      ) {
         write({ id: request.id, ok: true, output: memoHit.output })
         return
       }
       try {
-        const { output, code } = await runCaptured(buildProgram, request.args)
+        const parseStartedAt = Date.now()
+        const { output, code } = await runCaptured(
+          buildProgram,
+          request.args,
+          progress => write({ id: request.id, progress }),
+        )
         if (code === 0) {
-          outputMemo.set(memoKey, { at: Date.now(), output })
+          if (configFingerprint !== null) {
+            outputMemo.set(memoKey, createOutputMemoEntry(parseStartedAt, Date.now(), output, configFingerprint))
+          }
           if (outputMemo.size > 32) {
-            const oldest = [...outputMemo.entries()].sort((a, b) => a[1].at - b[1].at)[0]
+            const oldest = [...outputMemo.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]
             if (oldest) outputMemo.delete(oldest[0])
           }
           write({ id: request.id, ok: true, output })
@@ -212,16 +433,35 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
       if (process.memoryUsage().rss > SERVE_MAX_RSS_BYTES) {
         const { clearSessionCache } = await import('./parser.js')
         const { clearLoadCacheMemo } = await import('./session-cache.js')
+        const { clearCodexMemCaches } = await import('./codex-cache.js')
+        const { clearAntigravityCacheStates } = await import('./providers/antigravity.js')
         clearSessionCache()
         clearLoadCacheMemo()
+        clearCodexMemCaches()
+        clearAntigravityCacheStates()
         if (typeof globalThis.gc === 'function') globalThis.gc()
       }
     })
   })
 
-  // The app owns this process: stdin closing means the app is gone.
-  await new Promise<void>((resolve) => {
-    rl.on('close', resolve)
-    process.stdin.on('end', resolve)
+  // The app owns this process: stdin closing (or failing) means the app is
+  // gone. Always release FSEvents handles and the module-global validator;
+  // otherwise an existing Claude root keeps a naturally closed child alive.
+  const transportClosed = new Promise<void>((resolve) => {
+    rl.once('close', resolve)
+    process.stdin.once('end', resolve)
+    process.stdin.once('error', resolve)
   })
+  try {
+    await transportClosed
+  } finally {
+    rl.close()
+    await watcherSetup
+    rootReuseValidation = null
+    try {
+      watcherLifecycle.resetValidator?.()
+    } finally {
+      watcherLifecycle.state?.close()
+    }
+  }
 }

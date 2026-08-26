@@ -3,6 +3,7 @@ import { randomBytes } from 'crypto'
 import { dirname, join } from 'path'
 import { homedir } from 'os'
 
+import { getCodeburnCacheDir } from './cache-dir.js'
 import {
   recordAntigravityStatusLinePayload,
   snapshotAntigravityStatusLinePayload,
@@ -54,12 +55,8 @@ function settingsPath(): string {
     ?? join(homedir(), '.gemini', 'antigravity-cli', 'settings.json')
 }
 
-function codeburnCacheDir(): string {
-  return process.env['CODEBURN_CACHE_DIR'] ?? join(homedir(), '.cache', 'codeburn')
-}
-
 function previousStatusLinePath(): string {
-  return join(codeburnCacheDir(), 'antigravity-statusline-previous.json')
+  return join(getCodeburnCacheDir(), 'antigravity-statusline-previous.json')
 }
 
 async function readSettings(): Promise<Settings> {

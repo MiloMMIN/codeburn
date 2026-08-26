@@ -4,12 +4,13 @@ import { basename, dirname, join, resolve, sep } from 'path'
 import { readSessionLines } from './fs-utils.js'
 import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
-import { normalizeContentBlocks } from './content-utils.js'
+import { normalizeContentBlocks, flatSlice, flatString } from './content-utils.js'
 import { discoverAllSessions, getProvider } from './providers/index.js'
-import { flushCodexCache } from './codex-cache.js'
+import { flushCodexCache, readCachedCodexResults, withCodexCacheDirectory, writeCachedCodexResults } from './codex-cache.js'
 import { antigravityCascadeIdFromPath, flushAntigravityCache, shouldReparseAntigravitySource } from './providers/antigravity.js'
-import { getDesktopSessionsDirs } from './providers/claude.js'
+import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { isSqliteBusyError } from './sqlite.js'
+import { getCodeburnCacheDir } from './cache-dir.js'
 import {
   type CachedCall,
   type CachedFile,
@@ -22,11 +23,16 @@ import {
   DURABLE_PROVIDER_NAMES,
   fingerprintFile,
   isCacheComplete,
+  isCacheDirty,
   loadCache,
+  markCacheDirty,
+  monthScopeForRange,
   reconcileFile,
   saveCache,
 } from './session-cache.js'
 import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
+import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool, type ClaudeWorkerParse, type ParseJob } from './parse-workers.js'
+import type { CodexFullParse } from './providers/codex.js'
 import { dateKey } from './day-aggregator.js'
 import type { ParsedProviderCall, SessionSource } from './providers/types.js'
 import type {
@@ -91,7 +97,27 @@ function isCoworkSession(cwd: string, filePath: string): boolean {
   })
 }
 
+// Memoizes resolveCanonicalProjectPath: every ParsedProviderCall with a
+// projectPath pays the .git-marker directory walk (one lstat per ancestor
+// level), and a session's calls all share one cwd — without this cache a
+// cold parse re-walks the same few directories thousands of times
+// (measured ~+5% cold-parse time for a large kiro store). Filesystem facts
+// can go stale in a long-lived process (a dir converted to a worktree
+// mid-run), so the cache is cleared with the session cache.
+// Stores the Promise, not the resolved value: callers within the same
+// Promise.all batch would otherwise all miss the cache and each re-walk the
+// filesystem before the first walk's result lands.
+const canonicalPathCache = new Map<string, Promise<{ path: string; isWorktree: boolean }>>()
+
 async function resolveCanonicalProjectPath(cwd: string): Promise<{ path: string; isWorktree: boolean }> {
+  const cached = canonicalPathCache.get(cwd)
+  if (cached) return cached
+  const result = resolveCanonicalProjectPathUncached(cwd)
+  canonicalPathCache.set(cwd, result)
+  return result
+}
+
+async function resolveCanonicalProjectPathUncached(cwd: string): Promise<{ path: string; isWorktree: boolean }> {
   const trimmed = cwd.trim()
   if (!trimmed) return { path: cwd, isWorktree: false }
 
@@ -1261,7 +1287,7 @@ export function collectToolResultMeta(entry: JournalEntry, map: Map<string, Tool
 export function collectSessionMeta(entry: JournalEntry, meta: SessionMeta): void {
   if (entry.type === 'ai-title') {
     const t = (entry as Record<string, unknown>)['aiTitle']
-    if (typeof t === 'string' && t.trim()) meta.title = t.trim().slice(0, 200)
+    if (typeof t === 'string' && t.trim()) meta.title = flatString(t.trim().slice(0, 200))
   } else if (entry.type === 'pr-link') {
     const url = (entry as Record<string, unknown>)['prUrl']
     if (typeof url === 'string' && url && !meta.prLinks.includes(url)) meta.prLinks.push(url)
@@ -1900,7 +1926,7 @@ export async function readAgentType(filePath: string): Promise<string | undefine
   const metaPath = filePath.replace(/\.jsonl$/, '.meta.json')
   try {
     const t = (JSON.parse(await readFile(metaPath, 'utf8')) as { agentType?: unknown }).agentType
-    if (typeof t === 'string' && t.trim()) return t.trim().slice(0, 100)
+    if (typeof t === 'string' && t.trim()) return flatString(t.trim().slice(0, 100))
   } catch { /* missing or unreadable meta */ }
   // Workflow agents always live under `subagents/workflows/`, so fall back to that
   // even when the meta sidecar is absent.
@@ -1988,168 +2014,239 @@ async function scanProjectDirs(
   const progressTotal = changedFiles.length
   let filesDone = 0
   emitScanProgress({ kind: 'tick', provider: 'claude', done: 0, total: progressTotal })
-  for (const { filePath, info, append } of changedFiles) {
-    delete section.files[filePath]
 
+  // Only whole-file re-parses go off-thread. Appends are the warm path: they read
+  // a few KB past the cached offset, so a thread hop would cost more than it saves.
+  const fullReparsePaths = changedFiles.filter(f => !f.append).map(f => f.filePath)
+  const pendingBytes = changedFiles.reduce((n, f) => f.append ? n : n + f.info.fp.sizeBytes, 0)
+  const decision = decideParseWorkers({ files: fullReparsePaths.length, bytes: pendingBytes })
+  if (process.env['CODEBURN_VERBOSE'] === '1') {
+    process.stderr.write(`codeburn: claude parse workers=${decision.workers} (${decision.reason})\n`)
+  }
+  // A pool that cannot even start (worker entry missing from an odd packaging,
+  // thread limit reached) must degrade to the serial parse, not fail the run.
+  let pool: ParseWorkerPool | null = null
+  if (decision.workers > 0) {
     try {
-      if (append) {
-        // Append-only growth: parse ONLY the bytes past the cached resume offset
-        // and merge with the cached turns, rather than re-reading the file from 0.
-        // On a studio machine where live agents constantly append to session
-        // JSONL, this is the dominant warm-run cost. The merged result is
-        // byte-for-byte identical to a full re-parse (see mergeBoundaryCalls).
-        const tracker = { lastCompleteLineOffset: append.readFromOffset }
-        const toolResultMeta = new Map<string, ToolResultMeta>()
-        const sessionMeta = emptySessionMeta()
-        const newEntries = await parseClaudeEntries(filePath, tracker, append.readFromOffset, { toolResultMeta, sessionMeta })
-        const cached = append.cached
-
-        // Straddle guard: a streamed assistant message id that first appeared in
-        // the committed prefix can be restated inside the appended region
-        // (image-heavy turns stream one id across several records over seconds).
-        // The appended region is grouped before this file's cached keys join
-        // seenMsgIds, so the restated id would count twice; suppressing it
-        // instead would freeze the stale first emission. Neither matches a full
-        // re-parse, so on any id overlap the shortcut is abandoned and the file
-        // re-parses from byte 0 (rare: ~0.3% of real files).
-        const cachedIds = new Set(cached.turns.flatMap(t => t.calls.map(c => c.deduplicationKey)))
-        const straddles = newEntries !== null && newEntries.some(e => {
-          const id = getMessageId(e)
-          return id !== null && cachedIds.has(id)
-        })
-        if (!straddles) {
-          const newTurns = newEntries
-            ? parsedTurnsToCachedTurns(groupIntoTurns(dedupeStreamingMessageIds(newEntries), seenMsgIds, toolResultMeta))
-            : []
-
-          const mergedTurns: CachedTurn[] = cached.turns.map(t => ({ ...t, calls: [...t.calls] }))
-          if (newTurns.length > 0) {
-            let startIdx = 0
-            // A first new turn with no leading user message is a continuation of
-            // the last cached turn — merge its calls in (a full re-parse would put
-            // them in that same turn), then append the remaining new turns.
-            if (!newTurns[0]!.userMessage.trim() && mergedTurns.length > 0) {
-              const last = mergedTurns[mergedTurns.length - 1]!
-              last.calls = mergeBoundaryCalls(last.calls, newTurns[0]!.calls)
-              // A PR referenced in the appended continuation belongs to this same
-              // turn: union its refs in so the shortcut matches a full re-parse.
-              const refs = Array.from(new Set([...(last.prRefs ?? []), ...(newTurns[0]!.prRefs ?? [])])).sort()
-              if (refs.length > 0) last.prRefs = refs
-              // A subagent spawned in the appended continuation belongs to this
-              // same turn: union its spawn ids in for the same reason.
-              const spawnIds = Array.from(new Set([...(last.spawnToolUseIds ?? []), ...(newTurns[0]!.spawnToolUseIds ?? [])]))
-              if (spawnIds.length > 0) last.spawnToolUseIds = spawnIds
-              startIdx = 1
-            }
-            for (let i = startIdx; i < newTurns.length; i++) mergedTurns.push(newTurns[i]!)
-          }
-
-          // The cached region's dedup keys were not added to seenMsgIds (only
-          // unchanged files pre-seed it), so add them now — a full re-parse would
-          // have, and later files dedup cross-file against them.
-          for (const t of cached.turns) for (const c of t.calls) seenMsgIds.add(c.deduplicationKey)
-
-          // First-cwd wins, and the first cwd lives in the cached region whenever
-          // one was resolved there; only re-derive if the cached region had none.
-          let canonicalCwd = cached.canonicalCwd
-          let canonicalProjectName = cached.canonicalProjectName
-          let workingDirectory = cached.workingDirectory
-          if (canonicalCwd === undefined && newEntries) {
-            const cwd = extractCanonicalCwd(newEntries)
-            workingDirectory = workingDirectory ?? cwd
-            const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
-            canonicalCwd = canonical?.path
-            canonicalProjectName = canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined
-          }
-
-          // Inventory is a sorted set union; cached (older entries) ∪ new = full.
-          const mcpInventory = newEntries
-            ? Array.from(new Set([...cached.mcpInventory, ...extractMcpInventory(newEntries)])).sort()
-            : cached.mcpInventory
-
-          // Session meta merges across the append boundary: title is last-wins
-          // (prefer the newly-parsed tail), PR links union, isSidechain is sticky.
-          // parentSessionId is sticky (cached-first, it is the earliest region);
-          // agentSpawnLinks union (cached-first, first-seen spawn id per agent wins).
-          const mergedTitle = sessionMeta.title ?? cached.title
-          const mergedPrLinks = Array.from(new Set([...(cached.prLinks ?? []), ...sessionMeta.prLinks]))
-          const mergedSidechain = cached.isSidechain === true || sessionMeta.isSidechain
-          const mergedParentSessionId = cached.parentSessionId ?? sessionMeta.parentSessionId
-          const mergedSpawnLinks = { ...sessionMeta.agentSpawnLinks, ...cached.agentSpawnLinks }
-          const mergedAmbiguousIds = Array.from(new Set([...(cached.ambiguousSpawnAgentIds ?? []), ...sessionMeta.ambiguousSpawnAgentIds]))
-
-          section.files[filePath] = {
-            fingerprint: info.fp,
-            lastCompleteLineOffset: tracker.lastCompleteLineOffset,
-            canonicalCwd,
-            ...(workingDirectory ? { workingDirectory } : {}),
-            canonicalProjectName,
-            mcpInventory,
-            turns: mergedTurns,
-            agentType: cached.agentType,
-            ...(mergedTitle ? { title: mergedTitle } : {}),
-            ...(mergedPrLinks.length > 0 ? { prLinks: mergedPrLinks } : {}),
-            ...(mergedSidechain ? { isSidechain: true } : {}),
-            ...(mergedParentSessionId ? { parentSessionId: mergedParentSessionId } : {}),
-            ...(Object.keys(mergedSpawnLinks).length > 0 ? { agentSpawnLinks: mergedSpawnLinks } : {}),
-            ...(mergedAmbiguousIds.length > 0 ? { ambiguousSpawnAgentIds: mergedAmbiguousIds } : {}),
-          }
-          ;(diskCache as { _dirty?: boolean })._dirty = true
-          filesDone++
-          await parseProgress.tick(filesDone)
-          if (filesDone % 50 === 0 || filesDone === progressTotal) {
-            emitScanProgress({ kind: 'tick', provider: 'claude', done: filesDone, total: progressTotal })
-          }
-          if (onFileParsed) await onFileParsed()
-          continue
-        }
-        // Straddled: fall through to the full re-parse below.
-      }
-
-      const tracker = { lastCompleteLineOffset: 0 }
-      const toolResultMeta = new Map<string, ToolResultMeta>()
-      const sessionMeta = emptySessionMeta()
-      const entries = await parseClaudeEntries(filePath, tracker, undefined, { toolResultMeta, sessionMeta })
-      if (!entries) { filesDone++; await parseProgress.tick(filesDone); continue }
-
-      const turns = groupIntoTurns(dedupeStreamingMessageIds(entries), seenMsgIds, toolResultMeta)
-      const cwd = extractCanonicalCwd(entries)
-      const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
-      section.files[filePath] = {
-        fingerprint: info.fp,
-        lastCompleteLineOffset: tracker.lastCompleteLineOffset,
-        canonicalCwd: canonical?.path,
-        ...(cwd ? { workingDirectory: cwd } : {}),
-        canonicalProjectName: canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined,
-        mcpInventory: extractMcpInventory(entries),
-        turns: parsedTurnsToCachedTurns(turns),
-        agentType: await readAgentType(filePath),
-        ...(sessionMeta.title ? { title: sessionMeta.title } : {}),
-        ...(sessionMeta.prLinks.length > 0 ? { prLinks: sessionMeta.prLinks } : {}),
-        ...(sessionMeta.isSidechain ? { isSidechain: true } : {}),
-        ...(sessionMeta.parentSessionId ? { parentSessionId: sessionMeta.parentSessionId } : {}),
-        ...(Object.keys(sessionMeta.agentSpawnLinks).length > 0 ? { agentSpawnLinks: sessionMeta.agentSpawnLinks } : {}),
-        ...(sessionMeta.ambiguousSpawnAgentIds.length > 0 ? { ambiguousSpawnAgentIds: sessionMeta.ambiguousSpawnAgentIds } : {}),
-      }
-      ;(diskCache as { _dirty?: boolean })._dirty = true
+      pool = new ParseWorkerPool(decision.workers)
     } catch (err) {
-      // A single malformed Claude session file must not abort the whole run — that
-      // would empty the daily-cache backfill and wipe the trend/history (issue #441,
-      // same isolation the provider path already has). Record a failure marker keyed
-      // by the current fingerprint so it isn't re-read and re-thrown every run; it
-      // re-parses only if the file changes.
-      section.files[filePath] = { fingerprint: info.fp, mcpInventory: [], turns: [], failed: true }
-      ;(diskCache as { _dirty?: boolean })._dirty = true
-      warnProviderParseFailure('claude', filePath, err)
+      process.stderr.write(`codeburn: parse workers unavailable, parsing serially (${err instanceof Error ? err.message : String(err)})\n`)
     }
-    filesDone++
-    await parseProgress.tick(filesDone)
-    // Machine-readable tick for the app splash (throttled to ~every 50 files so
-    // a large cold run doesn't flood stderr), plus a partial-progress save.
-    if (filesDone % 50 === 0 || filesDone === progressTotal) {
-      emitScanProgress({ kind: 'tick', provider: 'claude', done: filesDone, total: progressTotal })
+  }
+  const offThread = pool
+    ? parseFilesInOrder<ClaudeWorkerParse>(pool, fullReparsePaths.map(filePath => ({ kind: 'claude', filePath })))
+    : null
+  // Files whose worker result had to be thrown away because an earlier file had
+  // already claimed one of its message ids. Expected to stay near zero; a large
+  // count means the corpus is full of resumed sessions and the pool is doing
+  // double work.
+  let workerDiscards = 0
+
+  const installClaudeFile = async (filePath: string, info: FileInfo, parsed: ClaudeFileParse): Promise<void> => {
+    const cwd = parsed.workingDirectory
+    const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
+    section.files[filePath] = {
+      fingerprint: info.fp,
+      lastCompleteLineOffset: parsed.lastCompleteLineOffset,
+      canonicalCwd: canonical?.path,
+      ...(cwd ? { workingDirectory: cwd } : {}),
+      canonicalProjectName: canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined,
+      mcpInventory: parsed.mcpInventory,
+      turns: parsed.turns,
+      agentType: parsed.agentType,
+      ...(parsed.title ? { title: parsed.title } : {}),
+      ...(parsed.prLinks?.length ? { prLinks: parsed.prLinks } : {}),
+      ...(parsed.isSidechain ? { isSidechain: true } : {}),
+      ...(parsed.parentSessionId ? { parentSessionId: parsed.parentSessionId } : {}),
+      ...(Object.keys(parsed.agentSpawnLinks ?? {}).length > 0 ? { agentSpawnLinks: parsed.agentSpawnLinks } : {}),
+      ...(parsed.ambiguousSpawnAgentIds?.length ? { ambiguousSpawnAgentIds: parsed.ambiguousSpawnAgentIds } : {}),
     }
-    if (onFileParsed) await onFileParsed()
+    markCacheDirty(diskCache, 'claude', filePath)
+  }
+
+  try {
+    for (const { filePath, info, append } of changedFiles) {
+      // Marked here, not after the re-parse: an unreadable file `continue`s out
+      // below, and the deletion would otherwise live only in memory.
+      delete section.files[filePath]
+      markCacheDirty(diskCache, 'claude', filePath)
+
+      // Off-thread results arrive in this order (parseFilesInOrder), so the Nth
+      // full re-parse here is the Nth yielded result — appends never consume one,
+      // in either the shortcut or the straddled-fallthrough case. A worker parses
+      // against an EMPTY dedup set, so an EMPTY id intersection is the proof that a
+      // serial parse would have dropped nothing either — that, and only that, makes
+      // the result installable. On any overlap the WHOLE file is discarded and
+      // re-parsed in-process. Never patch the overlapping turns out of a worker
+      // result instead: a drop is not local to its own turn, because
+      // parsedTurnsToCachedTurns delta-encodes gitBranch across turns, so removing
+      // one turn changes whether a LATER turn carries a gitBranch key.
+      // Deliberately OUTSIDE the per-file try below: the pairing is positional, and
+      // a misalignment would install one session's turns under another's path — a
+      // wrong number nobody would ever notice, so it fails the run instead of being
+      // caught as a parse failure.
+      let parsed: ClaudeFileParse | null | undefined
+      if (offThread && !append) {
+        const result = (await offThread.next()).value
+        if (result?.ok && result.parsed) {
+          if (result.parsed.path !== filePath) {
+            throw new Error(`claude parse worker result out of order: got ${result.parsed.path}, expected ${filePath}`)
+          }
+          if (result.parsed.msgIds.some(id => seenMsgIds.has(id))) {
+            workerDiscards++
+            parsed = undefined
+          } else {
+            for (const id of result.parsed.msgIds) seenMsgIds.add(id)
+            parsed = result.parsed
+          }
+        } else if (result?.ok) {
+          parsed = null
+        }
+      }
+
+      try {
+        if (append) {
+          // Append-only growth: parse ONLY the bytes past the cached resume offset
+          // and merge with the cached turns, rather than re-reading the file from 0.
+          // On a studio machine where live agents constantly append to session
+          // JSONL, this is the dominant warm-run cost. The merged result is
+          // byte-for-byte identical to a full re-parse (see mergeBoundaryCalls).
+          const tracker = { lastCompleteLineOffset: append.readFromOffset }
+          const toolResultMeta = new Map<string, ToolResultMeta>()
+          const sessionMeta = emptySessionMeta()
+          const newEntries = await parseClaudeEntries(filePath, tracker, append.readFromOffset, { toolResultMeta, sessionMeta })
+          const cached = append.cached
+
+          // Straddle guard: a streamed assistant message id that first appeared in
+          // the committed prefix can be restated inside the appended region
+          // (image-heavy turns stream one id across several records over seconds).
+          // The appended region is grouped before this file's cached keys join
+          // seenMsgIds, so the restated id would count twice; suppressing it
+          // instead would freeze the stale first emission. Neither matches a full
+          // re-parse, so on any id overlap the shortcut is abandoned and the file
+          // re-parses from byte 0 (rare: ~0.3% of real files).
+          const cachedIds = new Set(cached.turns.flatMap(t => t.calls.map(c => c.deduplicationKey)))
+          const straddles = newEntries !== null && newEntries.some(e => {
+            const id = getMessageId(e)
+            return id !== null && cachedIds.has(id)
+          })
+          if (!straddles) {
+            const newTurns = newEntries
+              ? parsedTurnsToCachedTurns(groupIntoTurns(dedupeStreamingMessageIds(newEntries), seenMsgIds, toolResultMeta))
+              : []
+
+            const mergedTurns: CachedTurn[] = cached.turns.map(t => ({ ...t, calls: [...t.calls] }))
+            if (newTurns.length > 0) {
+              let startIdx = 0
+              // A first new turn with no leading user message is a continuation of
+              // the last cached turn — merge its calls in (a full re-parse would put
+              // them in that same turn), then append the remaining new turns.
+              if (!newTurns[0]!.userMessage.trim() && mergedTurns.length > 0) {
+                const last = mergedTurns[mergedTurns.length - 1]!
+                last.calls = mergeBoundaryCalls(last.calls, newTurns[0]!.calls)
+                // A PR referenced in the appended continuation belongs to this same
+                // turn: union its refs in so the shortcut matches a full re-parse.
+                const refs = Array.from(new Set([...(last.prRefs ?? []), ...(newTurns[0]!.prRefs ?? [])])).sort()
+                if (refs.length > 0) last.prRefs = refs
+                // A subagent spawned in the appended continuation belongs to this
+                // same turn: union its spawn ids in for the same reason.
+                const spawnIds = Array.from(new Set([...(last.spawnToolUseIds ?? []), ...(newTurns[0]!.spawnToolUseIds ?? [])]))
+                if (spawnIds.length > 0) last.spawnToolUseIds = spawnIds
+                startIdx = 1
+              }
+              for (let i = startIdx; i < newTurns.length; i++) mergedTurns.push(newTurns[i]!)
+            }
+
+            // The cached region's dedup keys were not added to seenMsgIds (only
+            // unchanged files pre-seed it), so add them now — a full re-parse would
+            // have, and later files dedup cross-file against them.
+            for (const t of cached.turns) for (const c of t.calls) seenMsgIds.add(c.deduplicationKey)
+
+            // First-cwd wins, and the first cwd lives in the cached region whenever
+            // one was resolved there; only re-derive if the cached region had none.
+            let canonicalCwd = cached.canonicalCwd
+            let canonicalProjectName = cached.canonicalProjectName
+            let workingDirectory = cached.workingDirectory
+            if (canonicalCwd === undefined && newEntries) {
+              const cwd = extractCanonicalCwd(newEntries)
+              workingDirectory = workingDirectory ?? cwd
+              const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
+              canonicalCwd = canonical?.path
+              canonicalProjectName = canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined
+            }
+
+            // Inventory is a sorted set union; cached (older entries) ∪ new = full.
+            const mcpInventory = newEntries
+              ? Array.from(new Set([...cached.mcpInventory, ...extractMcpInventory(newEntries)])).sort()
+              : cached.mcpInventory
+
+            // Session meta merges across the append boundary: title is last-wins
+            // (prefer the newly-parsed tail), PR links union, isSidechain is sticky.
+            // parentSessionId is sticky (cached-first, it is the earliest region);
+            // agentSpawnLinks union (cached-first, first-seen spawn id per agent wins).
+            const mergedTitle = sessionMeta.title ?? cached.title
+            const mergedPrLinks = Array.from(new Set([...(cached.prLinks ?? []), ...sessionMeta.prLinks]))
+            const mergedSidechain = cached.isSidechain === true || sessionMeta.isSidechain
+            const mergedParentSessionId = cached.parentSessionId ?? sessionMeta.parentSessionId
+            const mergedSpawnLinks = { ...sessionMeta.agentSpawnLinks, ...cached.agentSpawnLinks }
+            const mergedAmbiguousIds = Array.from(new Set([...(cached.ambiguousSpawnAgentIds ?? []), ...sessionMeta.ambiguousSpawnAgentIds]))
+
+            section.files[filePath] = {
+              fingerprint: info.fp,
+              lastCompleteLineOffset: tracker.lastCompleteLineOffset,
+              canonicalCwd,
+              ...(workingDirectory ? { workingDirectory } : {}),
+              canonicalProjectName,
+              mcpInventory,
+              turns: mergedTurns,
+              agentType: cached.agentType,
+              ...(mergedTitle ? { title: mergedTitle } : {}),
+              ...(mergedPrLinks.length > 0 ? { prLinks: mergedPrLinks } : {}),
+              ...(mergedSidechain ? { isSidechain: true } : {}),
+              ...(mergedParentSessionId ? { parentSessionId: mergedParentSessionId } : {}),
+              ...(Object.keys(mergedSpawnLinks).length > 0 ? { agentSpawnLinks: mergedSpawnLinks } : {}),
+              ...(mergedAmbiguousIds.length > 0 ? { ambiguousSpawnAgentIds: mergedAmbiguousIds } : {}),
+            }
+            markCacheDirty(diskCache, 'claude', filePath)
+            filesDone++
+            await parseProgress.tick(filesDone)
+            if (filesDone % 50 === 0 || filesDone === progressTotal) {
+              emitScanProgress({ kind: 'tick', provider: 'claude', done: filesDone, total: progressTotal })
+            }
+            if (onFileParsed) await onFileParsed()
+            continue
+          }
+          // Straddled: fall through to the full re-parse below.
+        }
+
+        if (parsed === undefined) parsed = await parseClaudeFileFull(filePath, seenMsgIds)
+        if (!parsed) { filesDone++; await parseProgress.tick(filesDone); continue }
+
+        await installClaudeFile(filePath, info, parsed)
+      } catch (err) {
+        // A single malformed Claude session file must not abort the whole run — that
+        // would empty the daily-cache backfill and wipe the trend/history (issue #441,
+        // same isolation the provider path already has). Record a failure marker keyed
+        // by the current fingerprint so it isn't re-read and re-thrown every run; it
+        // re-parses only if the file changes.
+        section.files[filePath] = { fingerprint: info.fp, mcpInventory: [], turns: [], failed: true }
+        markCacheDirty(diskCache, 'claude', filePath)
+        warnProviderParseFailure('claude', filePath, err)
+      }
+      filesDone++
+      await parseProgress.tick(filesDone)
+      // Machine-readable tick for the app splash (throttled to ~every 50 files so
+      // a large cold run doesn't flood stderr), plus a partial-progress save.
+      if (filesDone % 50 === 0 || filesDone === progressTotal) {
+        emitScanProgress({ kind: 'tick', provider: 'claude', done: filesDone, total: progressTotal })
+      }
+      if (onFileParsed) await onFileParsed()
+    }
+  } finally {
+    await pool?.close()
+  }
+  if (pool && process.env['CODEBURN_VERBOSE'] === '1') {
+    process.stderr.write(`codeburn: claude parse workers done, ${workerDiscards}/${fullReparsePaths.length} results re-parsed in-process on id overlap\n`)
   }
   parseProgress.finish()
 
@@ -2160,7 +2257,7 @@ async function scanProjectDirs(
       // but they carry attributable PR spend (surfaced above as a legacy split).
       if (section.files[cachedPath]?.prLinks?.length) continue
       delete section.files[cachedPath]
-      ;(diskCache as { _dirty?: boolean })._dirty = true
+      markCacheDirty(diskCache, 'claude', cachedPath)
     }
   }
 
@@ -2187,7 +2284,13 @@ async function scanProjectDirs(
     let carriedPrRefs: string[] | undefined
     let prRefsAtRangeStart: string[] | undefined
     let frozePrRefs = !dateRange
-    let classifiedTurns = cachedFile.turns.map(turn => {
+    // The keep/drop decision is taken on the RAW turn, before classifying it:
+    // `cachedTurnToClassified` maps `calls` 1:1 onto `assistantCalls`, so a turn
+    // with no call in range is dropped whole by the slicer below and classifying
+    // it is pure waste (on a week view that is nearly all of history). The
+    // carries above still run over the FULL ordered turn list.
+    const classifiedTurns: ClassifiedTurn[] = []
+    for (const turn of cachedFile.turns) {
       if (turn.gitBranch) carriedBranch = turn.gitBranch
       if (dateRange && !frozePrRefs) {
         const firstTs = turn.calls[0]?.timestamp
@@ -2197,10 +2300,16 @@ async function scanProjectDirs(
         }
       }
       if (turn.prRefs?.length) carriedPrRefs = turn.prRefs
-      return cachedTurnToClassified(turn, carriedBranch)
-    })
-    // Captured from the FULL turn list, before the date slice below can drop the
-    // turn a branch was first seen on. Lets the by-branch report keep this
+      if (dateRange && !callsInRange(turn.calls, dateRange)) continue
+      const classified = cachedTurnToClassified(turn, carriedBranch)
+      // Slice rather than drop: a turn spanning local midnight would otherwise
+      // lose every call that lands in the requested day (issue #852). Only
+      // `assistantCalls`/`timestamp` are touched — see classifiedTurnSlicedToRange.
+      const sliced = dateRange ? classifiedTurnSlicedToRange(classified, dateRange) : classified
+      if (sliced) classifiedTurns.push(sliced)
+    }
+    // Captured from the FULL turn list, which the date slice above can strip of
+    // the turn a branch was first seen on. Lets the by-branch report keep this
     // session's in-range unbranched spend as `null` instead of discarding it.
     const everHadBranch = carriedBranch !== undefined
 
@@ -2209,16 +2318,6 @@ async function scanProjectDirs(
     // right PR even when its launching turn is later sliced out of range. Only for
     // sessions that both spawned subagents and referenced a PR.
     const spawnPrSets = cachedFile.prLinks?.length ? buildSpawnPrSets(cachedFile.turns) : {}
-
-    if (dateRange) {
-      // Slice rather than drop: a turn spanning local midnight would otherwise
-      // lose every call that lands in the requested day (issue #852). Only
-      // `assistantCalls`/`timestamp` are touched — see classifiedTurnSlicedToRange.
-      classifiedTurns = classifiedTurns.flatMap(turn => {
-        const sliced = classifiedTurnSlicedToRange(turn, dateRange)
-        return sliced ? [sliced] : []
-      })
-    }
 
     // A PR-linked parent that spawned subagents is kept even when its OWN turns all
     // fall out of range, as a 0-cost fold ANCHOR: an in-range child (an async agent
@@ -2453,7 +2552,7 @@ function parsedTurnToCachedTurn(turn: ParsedTurn): CachedTurn {
   return {
     timestamp: turn.timestamp,
     sessionId: turn.sessionId,
-    userMessage: turn.userMessage.slice(0, 2000),
+    userMessage: flatSlice(turn.userMessage, 2000),
     calls: turn.assistantCalls.map(apiCallToCachedCall),
     // Stored per-turn directly (already sorted/deduped in groupIntoTurns), unlike
     // gitBranch's change-detection dedup, so each turn's refs are self-contained.
@@ -2484,7 +2583,7 @@ function providerCallToCachedTurn(call: ParsedProviderCall): CachedTurn {
   return {
     timestamp: call.timestamp,
     sessionId: call.sessionId,
-    userMessage: call.userMessage.slice(0, 2000),
+    userMessage: flatSlice(call.userMessage, 2000),
     calls: [providerCallToCachedCall(call)],
     ...(prRefs.length ? { prRefs } : {}),
   }
@@ -2507,7 +2606,7 @@ function providerCallsToCachedTurns(calls: ParsedProviderCall[]): CachedTurn[] {
       turn = {
         timestamp: call.timestamp,
         sessionId: call.sessionId,
-        userMessage: call.userMessage.slice(0, 2000),
+        userMessage: flatSlice(call.userMessage, 2000),
         calls: [],
         ...(prRefs.length ? { prRefs } : {}),
       }
@@ -2647,6 +2746,54 @@ async function parseClaudeEntries(
   return entries
 }
 
+// Everything a cold Claude re-parse does for ONE file: read + decode + line-parse
+// the JSONL, group it into turns, shape it for the cache. Depends on nothing
+// process-wide except `seenMsgIds`, so a worker thread can run it against a fresh
+// empty set and the parent can install the result verbatim once it has confirmed
+// none of those ids were already claimed by an earlier file. Canonical-path
+// resolution deliberately stays with the caller: it walks the filesystem behind a
+// process-global memo.
+export type ClaudeFileParse = {
+  lastCompleteLineOffset: number
+  workingDirectory?: string
+  mcpInventory: string[]
+  turns: CachedTurn[]
+  agentType?: string
+  title?: string
+  prLinks?: string[]
+  isSidechain?: boolean
+  parentSessionId?: string
+  agentSpawnLinks?: Record<string, string>
+  ambiguousSpawnAgentIds?: string[]
+}
+
+export async function parseClaudeFileFull(
+  filePath: string,
+  seenMsgIds: Set<string>,
+): Promise<ClaudeFileParse | null> {
+  const tracker = { lastCompleteLineOffset: 0 }
+  const toolResultMeta = new Map<string, ToolResultMeta>()
+  const sessionMeta = emptySessionMeta()
+  const entries = await parseClaudeEntries(filePath, tracker, undefined, { toolResultMeta, sessionMeta })
+  if (!entries) return null
+
+  const turns = groupIntoTurns(dedupeStreamingMessageIds(entries), seenMsgIds, toolResultMeta)
+  const cwd = extractCanonicalCwd(entries)
+  return {
+    lastCompleteLineOffset: tracker.lastCompleteLineOffset,
+    ...(cwd ? { workingDirectory: cwd } : {}),
+    mcpInventory: extractMcpInventory(entries),
+    turns: parsedTurnsToCachedTurns(turns),
+    agentType: await readAgentType(filePath),
+    ...(sessionMeta.title ? { title: sessionMeta.title } : {}),
+    ...(sessionMeta.prLinks.length > 0 ? { prLinks: sessionMeta.prLinks } : {}),
+    ...(sessionMeta.isSidechain ? { isSidechain: true } : {}),
+    ...(sessionMeta.parentSessionId ? { parentSessionId: sessionMeta.parentSessionId } : {}),
+    ...(Object.keys(sessionMeta.agentSpawnLinks).length > 0 ? { agentSpawnLinks: sessionMeta.agentSpawnLinks } : {}),
+    ...(sessionMeta.ambiguousSpawnAgentIds.length > 0 ? { ambiguousSpawnAgentIds: sessionMeta.ambiguousSpawnAgentIds } : {}),
+  }
+}
+
 function getOrCreateProviderSection(cache: SessionCache, provider: string): ProviderSection {
   const envFp = computeEnvFingerprint(provider)
   const existing = cache.providers[provider]
@@ -2665,6 +2812,7 @@ function getOrCreateProviderSection(cache: SessionCache, provider: string): Prov
     }
   }
   cache.providers[provider] = section
+  markCacheDirty(cache, provider)
   return section
 }
 
@@ -2782,10 +2930,15 @@ export function emitScanProgress(event: ScanProgressEvent): void {
   try { process.stderr.write(`${PROGRESS_LINE_PREFIX}${JSON.stringify(event)}\n`) } catch { /* stderr closed */ }
 }
 
-// Minimum spacing between partial-progress saves during a cold parse. Low enough
+// Files parsed between partial-progress saves during a cold parse. Low enough
 // that an interrupted long run loses little work, high enough that repeated
-// full-cache writes never dominate a fast warm run.
-const PROGRESS_SAVE_THROTTLE_MS = 5000
+// cache writes never dominate the parse.
+const PROGRESS_SAVE_FILE_INTERVAL = 2000
+// Only the claude scan reports per file; every other provider calls saveProgress
+// once, at its own boundary. Without a time floor the counter would never reach
+// the interval during a long non-claude phase and progress saves would simply
+// stop happening there.
+const PROGRESS_SAVE_MAX_INTERVAL_MS = 30_000
 
 export function createScanProgress(label: string, total: number) {
   const show = !interactiveScanUI && total > 20 && process.stderr.isTTY === true
@@ -2832,8 +2985,8 @@ function turnSlicedToRange(turn: CachedTurn, dateRange: DateRange): CachedTurn |
   return { ...turn, calls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp }
 }
 
-// Same slice, applied post-classification (scanProjectDirs classifies every
-// turn from its FULL call list up front, before date filtering — see the
+// Same slice, applied post-classification (scanProjectDirs classifies each
+// surviving turn from its FULL call list, before date filtering — see the
 // carriedBranch/carriedPrRefs comments in scanProjectDirs — so this only
 // trims `assistantCalls` and re-anchors `timestamp`; `category`/`subCategory`/
 // `retries`/`hasEdits` stay exactly as classified from the complete turn.
@@ -2869,6 +3022,10 @@ async function parseProviderSources(
 ): Promise<ProjectSummary[]> {
   const provider = await getProvider(providerName)
   if (!provider) return []
+  // The environment is a call-time input. Capture Antigravity's cache target
+  // for this whole parse transaction so a host changing CODEBURN_CACHE_DIR
+  // before the final flush cannot redirect A's dirty state into (or past) B.
+  const antigravityCacheDir = providerName === 'antigravity' ? getCodeburnCacheDir() : undefined
 
   const section = getOrCreateProviderSection(diskCache, providerName)
   const allDiscoveredFiles = new Set<string>()
@@ -2933,6 +3090,45 @@ async function parseProviderSources(
     }
   }
 
+  // Codex rollouts are the bulk of a cold parse (multi-GB against Claude's
+  // hundreds of MB), so whole-file decodes go to worker threads. A file the
+  // codex cache can serve exactly, or resume into from a byte offset, stays
+  // in-process: it reads a few KB, and it is the codex cache's own per-directory
+  // state that a thread must never own. The eligible list is built with the same
+  // filters (and in the same order) the parse loop applies, so the Nth result
+  // parseFilesInOrder yields is the Nth file that reaches the worker branch.
+  // The decision is per provider rather than pooled across Claude+Codex because
+  // the two scans run one after the other — at most one pool is ever alive — and
+  // a per-provider count is what the verbose line can honestly report.
+  const workerJobs: ParseJob[] = []
+  const workerPaths = new Set<string>()
+  let workerDiscards = 0
+  let pendingBytes = 0
+  if (providerName === 'codex' && !readOnly) {
+    for (const { source, fp } of changedSources) {
+      if (dateRange && fp.mtimeMs < dateRange.start.getTime()) continue
+      if (await readCachedCodexResults(source.path)) continue
+      workerJobs.push({ kind: 'codex', source })
+      workerPaths.add(source.path)
+      pendingBytes += fp.sizeBytes
+    }
+  }
+  const decision = workerJobs.length > 0
+    ? decideParseWorkers({ files: workerJobs.length, bytes: pendingBytes })
+    : { workers: 0, reason: 'no full parses pending' }
+  if (providerName === 'codex' && !readOnly && process.env['CODEBURN_VERBOSE'] === '1') {
+    process.stderr.write(`codeburn: codex parse workers=${decision.workers} (${decision.reason})\n`)
+  }
+  let pool: ParseWorkerPool | null = null
+  if (decision.workers > 0) {
+    try {
+      pool = new ParseWorkerPool(decision.workers)
+    } catch (err) {
+      process.stderr.write(`codeburn: parse workers unavailable, parsing serially (${err instanceof Error ? err.message : String(err)})\n`)
+    }
+  }
+  const offThread = pool ? parseFilesInOrder<CodexFullParse & { keys: string[]; path: string }>(pool, workerJobs) : null
+
   // Parse changed files, update cache
   let didParse = false
   // Track which paths have already been cleared this pass so that subsequent
@@ -2952,15 +3148,47 @@ async function parseProviderSources(
       // that pruned-away data is preserved for monotonic monthly totals.
       if (!provider.durableSources && !clearedPaths.has(source.path)) {
         delete section.files[source.path]
+        markCacheDirty(diskCache, providerName, source.path)
         clearedPaths.add(source.path)
       }
 
-      const parser = provider.createSessionParser(source, parserDedup, dateRange)
+      // Off-thread results arrive in this order, so the Nth eligible file here is
+      // the Nth yielded result. A worker decodes against an EMPTY dedup set, so an
+      // EMPTY key intersection is the proof that a serial parse would have dropped
+      // nothing either — that, and only that, makes the result installable. On any
+      // overlap (a forked rollout replaying its parent's token_count history is
+      // exactly this) the WHOLE file is discarded and re-parsed in-process against
+      // the real dedup set. Deliberately OUTSIDE the per-file try below: the
+      // pairing is positional, and a misalignment would install one rollout's
+      // calls under another's path — a wrong number nobody would ever notice, so
+      // it fails the run instead of being caught as a parse failure.
+      let providerCalls: ParsedProviderCall[] | undefined
+      if (offThread && workerPaths.has(source.path)) {
+        const result = (await offThread.next()).value
+        if (result?.ok && result.parsed) {
+          if (result.parsed.path !== source.path) {
+            throw new Error(`codex parse worker result out of order: got ${result.parsed.path}, expected ${source.path}`)
+          }
+          if (result.parsed.keys.some(k => parserDedup.has(k))) {
+            workerDiscards++
+          } else {
+            for (const k of result.parsed.keys) parserDedup.add(k)
+            providerCalls = result.parsed.calls
+            // The worker never touches the codex cache; publish its entry here,
+            // in install order, so flushCodexCache writes what serial would.
+            const write = result.parsed.write
+            if (write) await writeCachedCodexResults(source.path, write.project, providerCalls, write.fingerprint, write.resume)
+          }
+        }
+      }
 
       try {
-        const providerCalls: ParsedProviderCall[] = []
-        for await (const call of parser.parse()) {
-          providerCalls.push(call)
+        if (!providerCalls) {
+          const parser = provider.createSessionParser(source, parserDedup, dateRange)
+          providerCalls = []
+          for await (const call of parser.parse()) {
+            providerCalls.push(call)
+          }
         }
         const canonicalCalls = await Promise.all(providerCalls.map(canonicalizeProviderCallProject))
         const turns = providerCallsToCachedTurns(canonicalCalls)
@@ -2997,7 +3225,7 @@ async function parseProviderSources(
           }
         }
         didParse = true
-        ;(diskCache as { _dirty?: boolean })._dirty = true
+        markCacheDirty(diskCache, providerName, source.path)
       } catch (err) {
         if (isSqliteBusyError(err)) {
           warnProviderReadFailureOnce(providerName, err)
@@ -3010,16 +3238,20 @@ async function parseProviderSources(
         // on every refresh; it re-parses only if it changes. Empty turns => no
         // usage contributed.
         section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns: [], failed: true }
-        ;(diskCache as { _dirty?: boolean })._dirty = true
+        markCacheDirty(diskCache, providerName, source.path)
         warnProviderParseFailure(providerName, source.path, err)
         continue
       }
     }
   } finally {
+    await pool?.close()
+    if (pool && process.env['CODEBURN_VERBOSE'] === '1') {
+      process.stderr.write(`codeburn: codex parse workers done, ${workerDiscards}/${workerJobs.length} results re-parsed in-process on id overlap\n`)
+    }
     if (didParse && providerName === 'codex') await flushCodexCache()
     if (didParse && providerName === 'antigravity') {
       const liveIds = new Set(sources.map(s => antigravityCascadeIdFromPath(s.path)))
-      await flushAntigravityCache(liveIds)
+      await flushAntigravityCache(liveIds, antigravityCacheDir)
     }
   }
 
@@ -3027,14 +3259,14 @@ async function parseProviderSources(
   // parseAllSessions can fast-check without a getProvider() round-trip.
   if (!readOnly && provider.durableSources && !section.durable) {
     section.durable = true
-    ;(diskCache as { _dirty?: boolean })._dirty = true
+    markCacheDirty(diskCache, providerName)
   }
 
   if (!readOnly && sources.length > 0 && !provider.durableSources) {
     for (const cachedPath of Object.keys(section.files)) {
       if (!allDiscoveredFiles.has(cachedPath)) {
         delete section.files[cachedPath]
-        ;(diskCache as { _dirty?: boolean })._dirty = true
+        markCacheDirty(diskCache, providerName, cachedPath)
       }
     }
   }
@@ -3051,7 +3283,7 @@ async function parseProviderSources(
         .reduce((max, ts) => Math.max(max, ts), 0)
       if (newestTs > 0 && newestTs < cutoffMs) {
         delete section.files[cachedPath]
-        ;(diskCache as { _dirty?: boolean })._dirty = true
+        markCacheDirty(diskCache, providerName, cachedPath)
       }
     }
   }
@@ -3190,7 +3422,15 @@ async function parseProviderSources(
 
 const CACHE_TTL_MS = 180_000
 const MAX_CACHE_ENTRIES = 10
-const sessionCache = new Map<string, { data: ProjectSummary[]; ts: number; startMs?: number; endMs?: number; sig?: string }>()
+type SessionCacheEntry = {
+  data: ProjectSummary[]
+  createdAt: number
+  validatedFrom: number
+  startMs?: number
+  endMs?: number
+  sig?: string
+}
+const sessionCache = new Map<string, SessionCacheEntry>()
 
 // Burst reuse for a resident process (codeburn serve). Every payload command
 // anchors its range end at its own `new Date()`, so two panel fetches issued
@@ -3207,15 +3447,16 @@ function parseBurstWindowMs(): number {
 
 // A resident process (codeburn serve) can install a validator that answers
 // "has any watched session root changed since this timestamp?" — typically
-// backed by fs.watch over every provider's probeRoots(). While the validator
-// reports clean, a previous parse stays reusable well past the burst window,
-// bounded by a hard cap so a missed filesystem event self-heals instead of
-// pinning stale data forever. Null (the default everywhere but serve) keeps
-// reuse strictly inside the burst window.
-let parseReuseValidator: ((sinceTs: number) => boolean) | null = null
+// backed by fs.watch over every provider's probeRoots(). Clean extends reuse
+// to the hard cap, dirty rejects every memo, and unknown (watcher coverage is
+// unavailable or began too late) falls back to the ordinary exact TTL / short
+// burst rather than disabling caching. Null keeps those ordinary semantics.
+export type ParseReuseValidation = 'clean' | 'dirty' | 'unknown'
+type ParseReuseValidator = (sinceTs: number) => ParseReuseValidation
+let parseReuseValidator: ParseReuseValidator | null = null
 const VALIDATED_REUSE_CAP_MS = 5 * 60 * 1000
 
-export function setParseReuseValidator(validator: ((sinceTs: number) => boolean) | null): void {
+export function setParseReuseValidator(validator: ParseReuseValidator | null): void {
   parseReuseValidator = validator
 }
 
@@ -3227,9 +3468,13 @@ function burstReuse(dateRange: DateRange, sig: string): ProjectSummary[] | null 
   const endMs = dateRange.end.getTime()
   for (const entry of sessionCache.values()) {
     if (entry.sig !== sig || entry.startMs !== startMs || entry.endMs === undefined) continue
-    const age = now - entry.ts
+    const validation = parseReuseValidator?.(entry.validatedFrom) ?? 'unknown'
+    // A dirty event during the producing parse must not be hidden even by the
+    // short burst. Unknown coverage, however, retains that bounded fallback.
+    if (validation === 'dirty') continue
+    const age = now - entry.createdAt
     const insideBurst = age <= windowMs
-    const validatedClean = parseReuseValidator !== null && age <= VALIDATED_REUSE_CAP_MS && parseReuseValidator(entry.ts)
+    const validatedClean = validation === 'clean' && age <= VALIDATED_REUSE_CAP_MS
     if (!insideBurst && !validatedClean) continue
     if (endMs < entry.endMs || endMs - entry.endMs > Math.max(windowMs, validatedClean ? VALIDATED_REUSE_CAP_MS : 0)) continue
     return filterProjectsByDateRange(entry.data, dateRange)
@@ -3237,34 +3482,36 @@ function burstReuse(dateRange: DateRange, sig: string): ProjectSummary[] | null 
   return null
 }
 
-function cacheKey(dateRange?: DateRange, providerFilter?: string): string {
+function cacheKey(dateRange: DateRange | undefined, providerFilter: string | undefined, claudeDiscoveryRoots: readonly string[]): string {
   const s = dateRange ? `${dateRange.start.getTime()}:${dateRange.end.getTime()}` : 'none'
-  // Include the Claude config-dir env so a config change in a long-lived
-  // process (menubar / GNOME extension / test workers) does not return
-  // stale data keyed under a previous configuration.
-  const claudeEnv = (process.env['CLAUDE_CONFIG_DIRS'] ?? '') + '|' + (process.env['CLAUDE_CONFIG_DIR'] ?? '')
+  // Key on the effective roots, not only their env inputs: GUI consumers can
+  // change config.json claudeConfigDirs while a resident serve process stays
+  // alive. Normalized roots also collapse syntactically different inputs that
+  // discover the same directories.
+  const claudeRoots = JSON.stringify(claudeDiscoveryRoots)
   // Proxy attribution (totalProxiedCostUSD) is computed live from proxyPaths and
   // then cached, so the key must change when that config changes.
   // Pricing-affecting config participates so a memoized parse (exact-key or
   // burst-reused in a resident serve process) can never present costs priced
   // under aliases/overrides/savings the user has since changed.
-  return `${s}:${providerFilter ?? 'all'}:${claudeEnv}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}`
+  return `${s}:${providerFilter ?? 'all'}:${claudeRoots}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}`
 }
 
 export function clearSessionCache(): void {
   sessionCache.clear()
+  canonicalPathCache.clear()
 }
 
-function cachePut(key: string, data: ProjectSummary[]) {
+function cachePut(key: string, data: ProjectSummary[], parseStartedAt: number) {
   const now = Date.now()
   for (const [k, v] of sessionCache) {
-    if (now - v.ts > CACHE_TTL_MS) sessionCache.delete(k)
+    if (now - v.createdAt > CACHE_TTL_MS) sessionCache.delete(k)
   }
   if (sessionCache.size >= MAX_CACHE_ENTRIES) {
-    const oldest = [...sessionCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0]
+    const oldest = [...sessionCache.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]
     if (oldest) sessionCache.delete(oldest[0])
   }
-  sessionCache.set(key, { data, ts: now, ...(putMeta ?? {}) })
+  sessionCache.set(key, { data, createdAt: now, validatedFrom: parseStartedAt, ...(putMeta ?? {}) })
   putMeta = null
 }
 
@@ -3707,19 +3954,50 @@ export function isSessionHydrationComplete(): boolean {
 // chart (gapStart = lastComputedDate + 1 never looks back at them).
 let readOnlyServedStale = false
 
-export async function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
-  const key = cacheKey(dateRange, providerFilter)
+export function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
+  // Capture synchronously, before the first await. AsyncLocalStorage keeps all
+  // Codex cache reads, dirty writes, and the final flush on this call-time
+  // directory even if an embedding host changes the process env mid-parse.
+  const codexCacheDir = getCodeburnCacheDir()
+  return withCodexCacheDirectory(codexCacheDir, () => parseAllSessionsInCacheScope(dateRange, providerFilter))
+}
+
+async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
+  // Anchor freshness before any config, cache, or session input is read. A
+  // watched-root event that lands while this parse is in flight must remain
+  // newer than the resulting memo instead of being blessed retroactively.
+  const parseStartedAt = Date.now()
+  const claudeDiscoveryRoots = await getClaudeConfigDirs()
+  const key = cacheKey(dateRange, providerFilter, claudeDiscoveryRoots)
   const cached = sessionCache.get(key)
-  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.data
+  if (cached) {
+    const age = Date.now() - cached.createdAt
+    const validation = parseReuseValidator?.(cached.validatedFrom) ?? 'unknown'
+    if (
+      validation !== 'dirty'
+      && (age < CACHE_TTL_MS || (validation === 'clean' && age <= VALIDATED_REUSE_CAP_MS))
+    ) return cached.data
+  }
   // The signature is the key minus the range: what must match for a burst
   // reuse (provider, config env, proxy hash) regardless of the now-anchor.
-  const burstSig = cacheKey(undefined, providerFilter)
+  const burstSig = cacheKey(undefined, providerFilter, claudeDiscoveryRoots)
   if (dateRange) {
     const reused = burstReuse(dateRange, burstSig)
     if (reused) return reused
   }
 
-  let diskCache = await loadCache()
+  // Load only the month shards a query over `dateRange` can possibly report
+  // on. Sessions whose every turn falls outside the range are dropped from the
+  // report anyway, so skipping their shards changes nothing except the bytes
+  // read — and a save writes only dirty months, leaving the skipped ones on
+  // disk untouched (see saveCache). Cross-file dedup is weakened, not broken:
+  // the pre-seed of `seenMsgIds` / `seenKeys` only covers loaded files, so a key
+  // that a skipped file also holds is no longer suppressed. Totals are
+  // unaffected (a suppressed duplicate contributes nothing either way), but for
+  // a proxied key emitted under two providers the attribution can land on a
+  // different provider than a full load would pick.
+  const loadScope = dateRange ? monthScopeForRange(dateRange.start, dateRange.end) : undefined
+  let diskCache = await loadCache(loadScope)
   await cleanupOrphanedTempFiles()
 
   // Cold-hydration coordination (advisory, cross-process). Engages whenever the
@@ -3732,10 +4010,10 @@ export async function parseAllSessions(dateRange?: DateRange, providerFilter?: s
   // doubt it proceeds unlocked.
   if (!isCacheComplete(diskCache)) {
     const hydration = await beginColdHydration(true)
-    if (hydration.waited) diskCache = await loadCache()
+    if (hydration.waited) diskCache = await loadCache(loadScope)
     const isCold = !isCacheComplete(diskCache)
     try {
-      return await runParse(key, diskCache, dateRange, providerFilter, { isCold })
+      return await runParse(key, diskCache, dateRange, providerFilter, { isCold, burstSig, parseStartedAt })
     } finally {
       await hydration.release()
     }
@@ -3747,20 +4025,20 @@ export async function parseAllSessions(dateRange?: DateRange, providerFilter?: s
   const priorSnapshot = diskCache
   const refresh = await acquireCacheRefreshLock()
   if (refresh.outcome === 'timed-out' || refresh.outcome === 'unavailable') {
-    return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true })
+    return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
   if (refresh.outcome === 'completed-by-other') {
-    return runParse(key, await loadCache(), dateRange, providerFilter, { readOnly: true })
+    return runParse(key, await loadCache(loadScope), dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
 
   try {
     // Reload only after ownership is canonical; this closes the lost-update
     // window between the pre-gate read and the holder's completed publication.
-    diskCache = await loadCache()
-    return await runParse(key, diskCache, dateRange, providerFilter, { refreshLock: refresh.handle })
+    diskCache = await loadCache(loadScope)
+    return await runParse(key, diskCache, dateRange, providerFilter, { refreshLock: refresh.handle, burstSig, parseStartedAt })
   } catch (err) {
     if (!(err instanceof RefreshFenceLostError) && !(err instanceof RefreshPublicationUnavailableError)) throw err
-    return runParse(key, await loadCache(), dateRange, providerFilter, { readOnly: true })
+    return runParse(key, await loadCache(loadScope), dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   } finally {
     await refresh.handle.release()
   }
@@ -3773,14 +4051,16 @@ type RunParseOptions = {
   isCold?: boolean
   readOnly?: boolean
   refreshLock?: RefreshLockHandle
+  burstSig: string
+  parseStartedAt: number
 }
 
 async function runParse(
   key: string,
   diskCache: SessionCache,
-  dateRange?: DateRange,
-  providerFilter?: string,
-  options: RunParseOptions = {},
+  dateRange: DateRange | undefined,
+  providerFilter: string | undefined,
+  options: RunParseOptions,
 ): Promise<ProjectSummary[]> {
   const { isCold = false, readOnly = false, refreshLock } = options
   readOnlyServedStale = false
@@ -3798,15 +4078,22 @@ async function runParse(
     providerGroups.set(source.provider, existing)
   }
 
-  // Cold-run robustness: persist partial progress during a long parse (throttled)
-  // so a run interrupted before the single end-of-parse save still leaves a warm
-  // cache behind. saveCache is atomic (temp + rename) and clears `_dirty`, so this
+  // Cold-run robustness: persist partial progress during a long parse so a run
+  // interrupted before the single end-of-parse save still leaves a warm cache
+  // behind. Triggered by files parsed rather than elapsed time: the cost of a
+  // save scales with the corpus, not the clock, so a wall-clock throttle made a
+  // slow cold parse rewrite the whole (growing) cache every few seconds. At this
+  // interval a ~18k-file cold parse saves under a dozen times. saveCache is
+  // atomic (temp + rename) and writes only the dirty provider shards, so this
   // never races the final save below.
+  let filesSinceSave = 0
   let lastSaveAt = Date.now()
   const saveProgress = async (): Promise<void> => {
     if (!isCold || readOnly) return
-    if (!(diskCache as { _dirty?: boolean })._dirty) return
-    if (Date.now() - lastSaveAt < PROGRESS_SAVE_THROTTLE_MS) return
+    if (!isCacheDirty(diskCache)) return
+    filesSinceSave++
+    if (filesSinceSave < PROGRESS_SAVE_FILE_INTERVAL && Date.now() - lastSaveAt < PROGRESS_SAVE_MAX_INTERVAL_MS) return
+    filesSinceSave = 0
     lastSaveAt = Date.now()
     try { await saveCache(diskCache) } catch { /* best-effort partial save */ }
   }
@@ -3890,7 +4177,7 @@ async function runParse(
   // partial saves keep `complete: false` and the next launch resumes cold.
   const wasComplete = isCacheComplete(diskCache)
   if (!readOnly && !wasComplete) diskCache.complete = true
-  if (!readOnly && ((diskCache as { _dirty?: boolean })._dirty || !wasComplete)) {
+  if (!readOnly && (isCacheDirty(diskCache) || !wasComplete)) {
     try {
       const published = await saveCache(diskCache, refreshLock?.verifyStillOwner)
       if (!published) throw new RefreshFenceLostError()
@@ -3942,7 +4229,7 @@ async function runParse(
 
   const result = Array.from(mergedMap.values()).sort((a, b) => b.totalCostUSD - a.totalCostUSD)
   correlateCrossProviderPrSessions(result)
-  if (dateRange) setCachePutMeta({ startMs: dateRange.start.getTime(), endMs: dateRange.end.getTime(), sig: cacheKey(undefined, providerFilter) })
-  cachePut(key, result)
+  if (dateRange) setCachePutMeta({ startMs: dateRange.start.getTime(), endMs: dateRange.end.getTime(), sig: options.burstSig })
+  cachePut(key, result, options.parseStartedAt)
   return result
 }

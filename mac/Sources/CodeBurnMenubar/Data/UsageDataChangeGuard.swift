@@ -72,6 +72,8 @@ enum UsageDataChangeGuard {
         add(expand(environment["CODEWHALE_HOME"] ?? path(homeDirectory, ".codewhale"), homeDirectory: homeDirectory), scanFirstLevelDirectories: false)
         add(path(homeDirectory, ".deepseek", "sessions"), scanFirstLevelDirectories: false)
         add(path(homeDirectory, ".cline", "data"), scanFirstLevelDirectories: false)
+        let dshHome = expand(environment["DSH_HOME"] ?? path(homeDirectory, ".dsh"), homeDirectory: homeDirectory)
+        add(path(dshHome, "sessions"))
         add(expand(environment["CODEBUFF_DATA_DIR"] ?? path(xdgConfig, "manicode"), homeDirectory: homeDirectory), scanFirstLevelDirectories: false)
         let factoryHome = expand(environment["FACTORY_DIR"] ?? path(homeDirectory, ".factory"), homeDirectory: homeDirectory)
         add(path(factoryHome, "sessions"), scanFirstLevelDirectories: false)

@@ -169,6 +169,7 @@
               "$HOME/.copilot",
               "$HOME/.cursor",
               "$HOME/.deepseek",
+              "$HOME/.dsh/sessions",
               "$HOME/.factory",
               "$HOME/.forge",
               "$HOME/.gemini",

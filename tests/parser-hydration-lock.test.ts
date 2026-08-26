@@ -6,12 +6,13 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { existsSync } from 'fs'
-import { mkdir, mkdtemp, rm, unlink, writeFile, readFile } from 'fs/promises'
+import { mkdir, mkdtemp, rm, unlink, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
 import { clearSessionCache, parseAllSessions } from '../src/parser.js'
-import { sessionCachePath } from '../src/session-cache.js'
+import { sessionCacheDir } from '../src/session-cache.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 
 let tmpHome: string
 let cacheDir: string
@@ -71,17 +72,16 @@ describe('parseAllSessions hydration lock', () => {
     await writeClaudeSession(50)
     expect(totalOutput(await parseAllSessions(undefined, 'claude'))).toBe(50)
 
-    const warm = JSON.parse(await readFile(sessionCachePath(), 'utf-8'))
-    for (const section of Object.values(warm.providers) as Array<{ files: Record<string, { turns: Array<{ calls: Array<{ usage: { outputTokens: number } }> }> }> }>) {
+    const tampered = await readCacheOnDisk()
+    for (const section of Object.values(tampered.providers)) {
       for (const file of Object.values(section.files)) {
         for (const turn of file.turns) for (const call of turn.calls) call.usage.outputTokens = 999
       }
     }
-    const tampered = JSON.stringify(warm)
 
     // Go cold: remove the versioned cache and drop the in-memory cache so the
     // next parse genuinely cold-starts and consults the lock.
-    await unlink(sessionCachePath())
+    await rm(sessionCacheDir(), { recursive: true })
     clearSessionCache()
 
     // A fresh lock held by another live process (pid 1 is always alive and is
@@ -97,7 +97,7 @@ describe('parseAllSessions hydration lock', () => {
 
     // The "first process" finishes: it leaves the warm (tampered) cache behind
     // and releases the lock. The waiter wakes, reloads, and serves the cache.
-    await writeFile(sessionCachePath(), tampered)
+    await writeCacheOnDisk(tampered)
     await unlink(lockPath())
 
     const result = await promise
@@ -119,8 +119,9 @@ describe('parseAllSessions hydration lock', () => {
     expect(totalOutput(result)).toBe(50)
     // Lock released in the finally.
     expect(existsSync(lockPath())).toBe(false)
-    // The parse warmed the versioned cache.
-    expect(existsSync(sessionCachePath())).toBe(true)
+    // The parse warmed the versioned cache: the envelope is what publishes it,
+    // so the directory merely existing proves nothing.
+    expect(existsSync(join(sessionCacheDir(), 'envelope.json'))).toBe(true)
   })
 
   it('ignores a fresh lock whose pid is dead', async () => {

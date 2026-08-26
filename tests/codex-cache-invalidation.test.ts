@@ -13,7 +13,7 @@ import { createHash } from 'crypto'
 import { join } from 'path'
 
 import { clearSessionCache, parseAllSessions } from '../src/parser.js'
-import { sessionCachePath } from '../src/session-cache.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 
 const testRoot = vi.hoisted(() => {
   const root = `${process.env['TMPDIR'] || '/tmp'}/codex-stale-repro-${process.pid}-${Date.now()}`
@@ -75,8 +75,7 @@ describe('codex parser change invalidates stale session-cache (#478/#513)', () =
     // release: pre-fix envFingerprint, unchanged file fingerprint, cached
     // turns lack the mcp__ tool. Also reset codex-results.json to v4 so the
     // provider (if it runs at all) must genuinely re-parse.
-    const cachePath = sessionCachePath()
-    const cache = JSON.parse(await readFile(cachePath, 'utf8'))
+    const cache = await readCacheOnDisk() as any
     cache.providers.codex.envFingerprint = preFixFingerprint()
     for (const f of Object.values(cache.providers.codex.files) as any[]) {
       for (const turn of f.turns) {
@@ -88,7 +87,7 @@ describe('codex parser change invalidates stale session-cache (#478/#513)', () =
         }
       }
     }
-    await writeFile(cachePath, JSON.stringify(cache))
+    await writeCacheOnDisk(cache)
     const codexCachePath = join(CACHE_DIR, 'codex-results.json')
     const codexCache = JSON.parse(await readFile(codexCachePath, 'utf8'))
     codexCache.version = 4

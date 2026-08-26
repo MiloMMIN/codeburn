@@ -77,11 +77,7 @@ actor FXRateCache {
     private var loaded = false
 
     private var cacheFilePath: String {
-        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        return base
-            .appendingPathComponent("codeburn-mac", isDirectory: true)
-            .appendingPathComponent("fx-rates.json")
-            .path
+        return (CodeBurnCacheDirectory.resolve() as NSString).appendingPathComponent("fx-rates.json")
     }
 
     private func loadIfNeeded() {

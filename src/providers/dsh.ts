@@ -3,7 +3,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 import zlib from 'zlib'
 
-import { readSessionFile } from '../fs-utils.js'
+import { MAX_SESSION_FILE_BYTES, readSessionFile } from '../fs-utils.js'
 import { calculateCost, getShortModelName } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
@@ -15,19 +15,37 @@ import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderC
 // so node:zlib's one-shot zstdDecompressSync (which decodes a single frame)
 // must be driven frame-by-frame behind a structural frame-boundary scan. The
 // scan below is a port of scanZstdFrames from the official
-// @deepseek-ai/dsh-session-persistence-jsonl package.
+// @deepseek-ai/dsh-session-persistence-jsonl package, which is third-party code
+// under its own license - see THIRD_PARTY_NOTICES.md.
 
 // zstd landed in node:zlib in 22.15 / 23.8; the package floor is lower, so the
 // provider degrades with a notice instead of assuming the export exists.
-const zstdDecompress = (zlib as { zstdDecompressSync?: (buf: Buffer) => Buffer }).zstdDecompressSync
+const zstdDecompress = (zlib as { zstdDecompressSync?: (buf: Buffer, opts?: { maxOutputLength?: number }) => Buffer }).zstdDecompressSync
 
 const ZSTD_MAGIC = 0xfd2fb528
-let warnedZstdUnavailable = false
 
-function warnZstdUnavailable(): void {
-  if (warnedZstdUnavailable) return
-  warnedZstdUnavailable = true
-  process.stderr.write('codeburn: DSH sessions need Node >= 22.15 (zstd support); skipping DSH usage.\n')
+// SESSION_FORMAT_VERSION in @deepseek-ai/dsh-session. DSH refuses to load a log
+// stamped with any other version, and a bump means an event's meaning changed,
+// so a foreign version is skipped rather than read with today's assumptions.
+// A zstd frame's declared content size is attacker-controlled, so a few KB of
+// crafted input can expand to gigabytes. Every decode is capped: no single
+// frame may exceed this, and no file may decode to more than it would have been
+// allowed to occupy uncompressed (MAX_SESSION_FILE_BYTES). Overflow throws, and
+// the caller skips the WHOLE file rather than counting the frames it got to.
+const MAX_FRAME_DECODED_BYTES = 64 * 1024 * 1024
+
+const SESSION_FORMAT_VERSION = 0
+
+const MIN_REASONABLE_TIMESTAMP_MS = 1_000_000_000_000
+
+// Discovery walks every session, so a per-file notice would repeat once per
+// log; each distinct message is worth saying exactly once.
+const noticed = new Set<string>()
+
+function notice(message: string): void {
+  if (noticed.has(message)) return
+  noticed.add(message)
+  process.stderr.write(message)
 }
 
 type ZstdFrame = { start: number; end: number }
@@ -94,13 +112,21 @@ type DshEvent = {
   seq?: number
   time?: number
   // Session header fields live at the top level of the first event.
+  version?: number
   id?: string
   cwd?: string
+  createdAt?: number
+  parentSession?: string
+  seedLength?: number
   data?: {
     turn?: number
     step?: number
     content?: Array<{ type?: string; text?: string }>
+    // `user/message` carries the message author: a real prompt is
+    // `{ kind: 'user' }`, agent-injected context is `{ kind: 'plugin' }`.
+    source?: { kind?: string }
     header?: { config?: { model?: string; provider?: string } }
+    message?: { source?: { kind?: string; model?: string; provider?: string } }
     chunk?: { type?: string; usage?: DshUsage }
     usage?: DshUsage
     name?: string
@@ -116,8 +142,9 @@ type StepBucket = {
   // projection). Time follows the winning report.
   final: boolean
   time?: number
-  // Model in force when this step's usage was reported (the most recent
-  // request/header config at that point in the log).
+  // Model that produced this step: the reporting assistant/message's own
+  // `message.source` when it names one, else the most recent request/header
+  // config (a header can change the model mid-turn between steps).
   model: string
   tools: string[]
   skills: string[]
@@ -145,6 +172,34 @@ function mapToolName(raw: string): string {
   return toolNameMap[raw] ?? raw
 }
 
+// Usage fields are whatever the JSON held. A string or array would flow
+// straight into the global token totals and the persisted cache, where
+// `0 + [1, 2]` silently becomes "01,2". Same semantics as copilot.ts.
+function numberOrZero(raw: unknown): number {
+  return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 0
+}
+
+// A log stamped with a version this parser was not written against is skipped
+// whole: a bump means an event's meaning changed, so reading it with today's
+// assumptions would report confident wrong numbers.
+function isReadableVersion(header: DshEvent): boolean {
+  if (header.version === SESSION_FORMAT_VERSION) return true
+  // Keyed on the version, not the path: a DSH upgrade makes EVERY session
+  // unreadable at once, and one line per session log is noise, not a report.
+  notice(`codeburn: skipping DSH sessions written in session format version ${String(header.version)}; upgrade codeburn.\n`)
+  return false
+}
+
+// DSH writes epoch milliseconds; promote a seconds-resolution value and reject
+// what stays implausible, matching the guard cline-cli.ts uses on the hazard.
+function isoTimestamp(value: number | undefined, fallback: string): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback
+  const ms = value < MIN_REASONABLE_TIMESTAMP_MS ? value * 1000 : value
+  const date = new Date(ms)
+  if (Number.isNaN(date.getTime()) || date.getTime() < MIN_REASONABLE_TIMESTAMP_MS) return fallback
+  return date.toISOString()
+}
+
 function getDshHome(override?: string): string {
   // An empty-string DSH_HOME is treated as unset.
   return override ?? (process.env['DSH_HOME'] || undefined) ?? join(homedir(), '.dsh')
@@ -158,12 +213,24 @@ function projectFromCwd(cwd: string, fallback: string): string {
 }
 
 // Decode every complete frame and yield its JSONL lines. A torn final frame is
-// ignored; a structurally corrupt file throws for the caller to report.
-function* readZstdLines(buffer: Buffer, maxFrames = Number.POSITIVE_INFINITY): Generator<string> {
+// ignored; a structurally corrupt file, or one that decodes past `budget`,
+// throws for the caller to report. Exported for the decode-budget test.
+export function* readZstdLines(
+  buffer: Buffer,
+  maxFrames = Number.POSITIVE_INFINITY,
+  budget = MAX_SESSION_FILE_BYTES,
+): Generator<string> {
   const { frames } = scanZstdFrames(buffer, maxFrames)
+  let remaining = budget
   for (const frame of frames) {
-    const text = zstdDecompress!(buffer.subarray(frame.start, frame.end)).toString('utf-8')
-    for (const line of text.split('\n')) {
+    if (remaining <= 0) throw new Error(`decodes past the ${budget}-byte cap`)
+    // node throws ERR_BUFFER_TOO_LARGE without allocating past the cap, so the
+    // per-frame limit doubles as the running budget for the frames after it.
+    const decoded = zstdDecompress!(buffer.subarray(frame.start, frame.end), {
+      maxOutputLength: Math.min(remaining, MAX_FRAME_DECODED_BYTES),
+    })
+    remaining -= decoded.length
+    for (const line of decoded.toString('utf-8').split('\n')) {
       if (line.trim()) yield line
     }
   }
@@ -172,11 +239,18 @@ function* readZstdLines(buffer: Buffer, maxFrames = Number.POSITIVE_INFINITY): G
 async function readEventLines(filePath: string): Promise<string[] | null> {
   if (filePath.endsWith('.zstd')) {
     if (!zstdDecompress) {
-      warnZstdUnavailable()
+      notice('codeburn: DSH sessions need Node >= 22.15 (zstd support); skipping DSH usage.\n')
       return null
     }
     let buffer: Buffer
     try {
+      // The whole log is buffered to scan its frames, so it needs the same
+      // oversize guard readSessionFile applies to the uncompressed variant.
+      const size = (await stat(filePath)).size
+      if (size > MAX_SESSION_FILE_BYTES) {
+        notice(`codeburn: skipped oversize DSH session log ${filePath} (${size} bytes)\n`)
+        return null
+      }
       buffer = await readFile(filePath)
     } catch {
       return null
@@ -184,7 +258,7 @@ async function readEventLines(filePath: string): Promise<string[] | null> {
     try {
       return [...readZstdLines(buffer)]
     } catch (err) {
-      process.stderr.write(`codeburn: skipped corrupt DSH session log ${filePath}: ${err instanceof Error ? err.message : err}\n`)
+      notice(`codeburn: skipped corrupt DSH session log ${filePath}: ${err instanceof Error ? err.message : err}\n`)
       return null
     }
   }
@@ -200,7 +274,7 @@ async function readSessionHeader(filePath: string): Promise<DshEvent | null> {
   const firstLine = async (): Promise<string | null> => {
     if (filePath.endsWith('.zstd')) {
       if (!zstdDecompress) {
-        warnZstdUnavailable()
+        notice('codeburn: DSH sessions need Node >= 22.15 (zstd support); skipping DSH usage.\n')
         return null
       }
       let head: Buffer
@@ -219,8 +293,11 @@ async function readSessionHeader(filePath: string): Promise<DshEvent | null> {
       }
       let { frames } = scanZstdFrames(head, 1)
       if (frames.length === 0) {
-        // Head read did not cover one full frame; take the whole file.
+        // Head read did not cover one full frame; take the whole file. A fork's
+        // first batch carries the whole inherited seed, so this is reachable on
+        // a real log and needs the same oversize guard as the parse read.
         try {
+          if ((await stat(filePath)).size > MAX_SESSION_FILE_BYTES) return null
           const full = await readFile(filePath)
           frames = scanZstdFrames(full, 1).frames
           if (frames.length === 0) return null
@@ -229,7 +306,9 @@ async function readSessionHeader(filePath: string): Promise<DshEvent | null> {
           return null
         }
       }
-      const text = zstdDecompress(head.subarray(frames[0]!.start, frames[0]!.end)).toString('utf-8')
+      const text = zstdDecompress(head.subarray(frames[0]!.start, frames[0]!.end), {
+        maxOutputLength: MAX_FRAME_DECODED_BYTES,
+      }).toString('utf-8')
       return text.split('\n').find(l => l.trim()) ?? null
     }
     const content = await readSessionFile(filePath)
@@ -240,7 +319,8 @@ async function readSessionHeader(filePath: string): Promise<DshEvent | null> {
     const line = await firstLine()
     if (!line) return null
     const event = JSON.parse(line) as DshEvent
-    return event.type === 'session' ? event : null
+    if (event.type !== 'session') return null
+    return isReadableVersion(event) ? event : null
   } catch {
     return null
   }
@@ -317,6 +397,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       let cwd = ''
       let model = 'unknown'
       let currentTurn = 0
+      let sessionStart = ''
+      // Events a forked session inherited from its parent. They are a verbatim
+      // copy of the parent's log, which codeburn parses as its own session, so
+      // counting them here would bill the same calls twice.
+      let seedLength = 0
       const userMessageByTurn = new Map<number, string>()
       const buckets = new Map<string, StepBucket>()
 
@@ -329,10 +414,17 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         }
 
         if (event.type === 'session') {
+          if (!isReadableVersion(event)) return
           sessionId = event.id ?? sessionId
           cwd = event.cwd ?? cwd
+          sessionStart = isoTimestamp(event.createdAt, sessionStart)
+          if (typeof event.parentSession === 'string' && event.parentSession && typeof event.seedLength === 'number') {
+            seedLength = event.seedLength
+          }
           continue
         }
+
+        if (typeof event.seq === 'number' && event.seq < seedLength) continue
 
         if (event.type === 'turn/start') {
           currentTurn = event.data?.turn ?? currentTurn
@@ -348,10 +440,15 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         }
 
         if (event.type === 'user/message') {
+          // Plugin-injected context (runtime snapshots, skill bodies, file-change
+          // notices) rides the same event type as a typed prompt; only the latter
+          // is a useful preview.
+          if (event.data?.source?.kind !== 'user') continue
+          if (userMessageByTurn.has(currentTurn)) continue
           const texts = (event.data?.content ?? [])
             .filter(c => c.type === 'text' && typeof c.text === 'string' && c.text)
             .map(c => c.text!)
-          if (texts.length > 0) userMessageByTurn.set(currentTurn, texts.join(' '))
+          if (texts.length > 0) userMessageByTurn.set(currentTurn, texts.join(' ').slice(0, 500))
           continue
         }
 
@@ -379,11 +476,16 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         let usage: DshUsage | undefined
         let isFinal = false
+        // The model that actually served the call, when the message records it.
+        // request/header only describes the request codeburn is about to see.
+        let reportedModel = model
         if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'usage') {
           usage = event.data.chunk.usage
         } else if (event.type === 'assistant/message' && event.data?.usage) {
           usage = event.data.usage
           isFinal = true
+          const messageModel = event.data.message?.source?.model
+          if (typeof messageModel === 'string' && messageModel) reportedModel = messageModel
         } else {
           continue
         }
@@ -404,7 +506,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           bucket.usage = usage
           bucket.final = isFinal
           bucket.time = event.time
-          bucket.model = model
+          bucket.model = reportedModel
         }
       }
 
@@ -416,11 +518,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
       for (const key of sortedKeys) {
         const bucket = buckets.get(key)!
-        const input = bucket.usage.inputTokens ?? 0
-        const output = bucket.usage.outputTokens ?? 0
-        const cacheRead = bucket.usage.cacheReadTokens ?? 0
-        const cacheWrite = bucket.usage.cacheWriteTokens ?? 0
-        const reasoning = bucket.usage.reasoningTokens ?? 0
+        const input = numberOrZero(bucket.usage.inputTokens)
+        const output = numberOrZero(bucket.usage.outputTokens)
+        const cacheRead = numberOrZero(bucket.usage.cacheReadTokens)
+        const cacheWrite = numberOrZero(bucket.usage.cacheWriteTokens)
+        const reasoning = numberOrZero(bucket.usage.reasoningTokens)
         if (input + output + cacheRead + cacheWrite + reasoning === 0) continue
 
         const dedupKey = `dsh:${sessionId || source.path}:${key}`
@@ -445,13 +547,14 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           tools: [...new Set(bucket.tools)],
           bashCommands: bucket.bashCommands,
           skills: bucket.skills.length > 0 ? [...new Set(bucket.skills)] : undefined,
-          timestamp: typeof bucket.time === 'number' ? new Date(bucket.time).toISOString() : '',
+          timestamp: isoTimestamp(bucket.time, sessionStart),
           speed: 'standard',
           deduplicationKey: dedupKey,
           userMessage: userMessageByTurn.get(turn!) ?? '',
           sessionId: sessionId || source.path,
           project: cwd ? projectFromCwd(cwd, source.project) : source.project,
           projectPath: cwd || undefined,
+          workingDirectory: cwd || undefined,
         }
       }
     },

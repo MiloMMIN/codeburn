@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createRequire } from 'node:module'
@@ -86,6 +86,37 @@ describe('cursor cache', () => {
     const { readCachedResults } = await import('../../src/cursor-cache.js')
     const result = await readCachedResults('/nonexistent/path.db', new Date(0).toISOString())
     expect(result).toBeNull()
+  })
+
+  it('honors CODEBURN_CACHE_DIR at call time', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cursor-cache-override-'))
+    const previousCacheDir = process.env['CODEBURN_CACHE_DIR']
+    const dbPath = join(root, 'state.vscdb')
+    const firstCacheDir = join(root, 'cache-a')
+    const secondCacheDir = join(root, 'cache-b')
+    const firstFloor = '2026-01-01T00:00:00.000Z'
+    const secondFloor = '2026-02-01T00:00:00.000Z'
+    await writeFile(dbPath, 'cursor-db-fixture')
+
+    try {
+      const { writeCachedResults } = await import('../../src/cursor-cache.js')
+      process.env['CODEBURN_CACHE_DIR'] = firstCacheDir
+      await writeCachedResults(dbPath, [], firstFloor)
+
+      process.env['CODEBURN_CACHE_DIR'] = secondCacheDir
+      await writeCachedResults(dbPath, [], secondFloor)
+
+      const firstPath = join(firstCacheDir, 'cursor-results.json')
+      const secondPath = join(secondCacheDir, 'cursor-results.json')
+      const first = JSON.parse(await readFile(firstPath, 'utf-8')) as { lookbackFloor: string }
+      const second = JSON.parse(await readFile(secondPath, 'utf-8')) as { lookbackFloor: string }
+      expect(first.lookbackFloor).toBe(firstFloor)
+      expect(second.lookbackFloor).toBe(secondFloor)
+    } finally {
+      if (previousCacheDir === undefined) delete process.env['CODEBURN_CACHE_DIR']
+      else process.env['CODEBURN_CACHE_DIR'] = previousCacheDir
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })
 

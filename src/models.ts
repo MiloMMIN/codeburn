@@ -1,8 +1,9 @@
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { join } from 'path'
-import { homedir } from 'os'
-import snapshotData from './data/litellm-snapshot.json'
-import fallbackData from './data/pricing-fallback.json'
+
+import { getCodeburnCacheDir } from './cache-dir.js'
+import snapshotData from './data/litellm-snapshot.json' with { type: 'json' }
+import fallbackData from './data/pricing-fallback.json' with { type: 'json' }
 import { fetchWithTimeout } from './fetch-utils.js'
 
 export type ModelCosts = {
@@ -143,13 +144,8 @@ function getLowercasePricingIndex(): Map<string, ModelCosts> {
   return lowercasePricingIndex
 }
 
-function getCacheDir(): string {
-  if (process.env['CODEBURN_CACHE_DIR']) return process.env['CODEBURN_CACHE_DIR']
-  return join(homedir(), '.cache', 'codeburn')
-}
-
 function getCachePath(): string {
-  return join(getCacheDir(), 'litellm-pricing.json')
+  return join(getCodeburnCacheDir(), 'litellm-pricing.json')
 }
 
 /// Clamp a per-token rate to a sane non-negative value. Defense in depth
@@ -202,7 +198,7 @@ async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
     if (stripped !== name && !pricing.has(stripped)) pricing.set(stripped, costs)
   }
 
-  await mkdir(getCacheDir(), { recursive: true })
+  await mkdir(getCodeburnCacheDir(), { recursive: true })
   await writeFile(getCachePath(), JSON.stringify({
     timestamp: Date.now(),
     data: Object.fromEntries(pricing),
@@ -998,4 +994,34 @@ export function getShortModelName(model: string): string {
     return segment ? getShortModelName(segment) : canonical
   }
   return canonical
+}
+
+// Pricing is process-global state assembled at CLI startup from the cached
+// LiteLLM snapshot plus user config. A parse worker thread starts with none of
+// it, and re-running loadPricing() there would mean N more disk reads (or, on a
+// cold pricing cache, N network fetches). Ship the resolved state across
+// instead, so every thread prices a call exactly as the main thread would.
+export type PricingSnapshot = {
+  pricing: Map<string, ModelCosts>
+  aliases: Record<string, string>
+  priceOverrides: Record<string, PriceOverrideRates>
+  localModelSavings: Record<string, string>
+}
+
+export function snapshotPricingState(): PricingSnapshot {
+  return {
+    pricing: pricingCache,
+    aliases: userAliases,
+    priceOverrides: userPriceOverridesConfig,
+    localModelSavings: userLocalModelSavings,
+  }
+}
+
+export function restorePricingState(snapshot: PricingSnapshot): void {
+  pricingCache = snapshot.pricing
+  sortedPricingKeys = null
+  lowercasePricingIndex = null
+  setModelAliases(snapshot.aliases)
+  setPriceOverrides(snapshot.priceOverrides)
+  setLocalModelSavings(snapshot.localModelSavings)
 }

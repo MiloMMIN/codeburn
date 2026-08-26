@@ -25,7 +25,7 @@
     <a href="https://github.com/sponsors/iamtoruk"><img src="https://img.shields.io/badge/sponsor-♥-F97316?logo=github" alt="Sponsor" /></a>
 </p>
 
-<p align="center">If CodeBurn shows you something your bill never did, <a href="https://github.com/getagentseal/codeburn/stargazers">star the repo</a> so other developers find it, and consider <a href="https://github.com/sponsors/iamtoruk">sponsoring</a> to keep 40 integrations honest.</p>
+<p align="center">If CodeBurn shows you something your bill never did, <a href="https://github.com/getagentseal/codeburn/stargazers">star the repo</a> so other developers find it, and consider <a href="https://github.com/sponsors/iamtoruk">sponsoring</a> to keep 41 integrations honest.</p>
 
 <table align="center">
   <tr>
@@ -61,11 +61,11 @@
 
 <p align="center"><em>Four surfaces, one source of truth: everything reads the session files already on your disk.</em></p>
 
-**CodeBurn is a free, open-source, local-first tool that tracks AI coding token usage and cost across 40 tools and agents (Claude Code, Cursor, Codex, Gemini, Grok and more), broken down by model, project, and task.**
+**CodeBurn is a free, open-source, local-first tool that tracks AI coding token usage and cost across 41 tools and agents (Claude Code, Cursor, Codex, Gemini, Grok and more), broken down by model, project, and task.**
 
 You pay for Claude, Codex, Cursor, and a stack of other AI tools. The bill tells you the total. It never tells you that half of it went to conversation instead of code, or that an expensive model burned your budget on work a cheaper one would have one-shot.
 
-CodeBurn does. It reads the session files your tools already write to disk and breaks down every token and dollar by **task, model, tool, and project**, across **40 AI tools**.
+CodeBurn does. It reads the session files your tools already write to disk and breaks down every token and dollar by **task, model, tool, and project**, across **41 AI tools**.
 
 Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your machine. Pricing comes from [LiteLLM](https://github.com/BerriAI/litellm), refreshed daily.
 
@@ -683,6 +683,7 @@ These are starting points, not verdicts. A 60% cache hit on a single experimenta
 | **Cline / Roo Code / KiloCode** | VS Code `globalStorage` across VS Code, VS Code Insiders, and VSCodium (Cline at `saoudrizwan.claude-dev`, plus `~/.cline/data`) | Cline-family agents. CodeBurn reads `ui_messages.json` from each task directory, extracting token counts from `type: "say"` entries with `say: "api_req_started"`. |
 | **Cline CLI** | `~/.cline/data/sessions/<session-id>/` (honors `CLINE_SESSION_DATA_DIR`, `CLINE_DATA_DIR`, `CLINE_DIR`) | The Cline command-line agent, whose layout is unrelated to the VS Code extension's. Reads `<session-id>.json` for session metadata and the rolled-up `usage`, and `<session-id>.messages.json` for the per-message `metrics` block (input, output, cacheRead, cacheWrite, cost) that becomes one call each. |
 | **CodeWhale** | `~/.codewhale/sessions/*.json` plus unmigrated legacy `~/.deepseek/sessions/*.json`; `$CODEWHALE_HOME/sessions` is an exact override | Emits one cumulative record per saved session. CodeWhale exposes only `total_tokens`, so CodeBurn preserves that aggregate in the input column rather than inventing an input/output split. Cost is the exact stored parent-session plus subagent USD total; model pricing is used only when the cost snapshot is absent. Tool blocks, shell commands, skills, and subagent types are retained. |
+| **DeepSeek Harness** (`dsh`) | `~/.dsh/sessions/--<slug>--/<session-id>/session.jsonl.zstd` (or `session.jsonl` when compression is off); `DSH_HOME` relocates the root | DeepSeek's open-source agent harness, unrelated to the CodeWhale desktop app. The `.zstd` log is a concatenation of independent zstd frames (one per write batch), decoded frame by frame; needs Node 22.15+. One call per `(turn, step)`, with usage from the step's `assistant/message` (the streamed `assistant/chunk` sample is a draft of the same call, never a second one). DSH records tokens but no cost, so calls are priced from the shared tables with reasoning billed at the output rate. |
 | **IBM Bob** | `User/globalStorage/ibm.bob-code/tasks/<task-id>/` (GA `IBM Bob` and preview `Bob-IDE` app folders) | Reads `ui_messages.json` for API request token/cost records and `api_conversation_history.json` for the selected model. |
 | **Kimi Code CLI** | `$KIMI_SHARE_DIR/sessions/<workdir-hash>/<session-id>/` or `~/.kimi/sessions/<workdir-hash>/<session-id>/` | Reads `wire.jsonl` `StatusUpdate.token_usage` records, mapping `input_other`, `input_cache_read`, `input_cache_creation`, and `output` into the standard token columns; includes subagents under each session's `subagents/` folder. |
 | **LingTai TUI** | `~/.lingtai/<agent>/logs/token_ledger.jsonl` plus project homes from `~/.lingtai-tui/registry.jsonl` (`<project>/.lingtai/<agent>/logs/token_ledger.jsonl`); honors `LINGTAI_HOME` / `LINGTAI_TUI_HOME` | Reads LingTai's append-only token ledger, mapping `input - cached` to fresh input, `cached` to cache reads, `output` to output, and `thinking` to reasoning. Nested daemon ledgers are skipped because parent ledgers already mirror daemon usage with `source`/`run_id` tags. |
@@ -722,12 +723,12 @@ CodeBurn deduplicates messages (by API message ID for Claude, by cumulative toke
 
 CodeBurn is free, runs entirely on your machine, and exists to cut your AI bill. If it has already saved you more than a sponsorship costs, consider sending a little of that back.
 
-Keeping 40 integrations accurate is constant work. The tools underneath change every week: Cursor reshapes its database, Claude moves a config path, new models ship at new prices. Sponsorship keeps CodeBurn current with all of it, so the numbers you see are always the real ones.
+Keeping 41 integrations accurate is constant work. The tools underneath change every week: Cursor reshapes its database, Claude moves a config path, new models ship at new prices. Sponsorship keeps CodeBurn current with all of it, so the numbers you see are always the real ones.
 
 Where your sponsorship goes:
 
 - **Honest numbers.** New models and price changes are mapped quickly, so your cost is the real cost, not a guess.
-- **More tools.** Every one of the 40 providers started as a single file. Sponsorship funds the next one.
+- **More tools.** Every one of the 41 providers started as a single file. Sponsorship funds the next one.
 - **Fast fixes.** When a vendor breaks something, paid time is what gets it patched now instead of someday.
 
 Sponsoring as a team or company? Your logo lands right here, in front of every developer who opens the repo. The first sponsor gets it to themselves until the next one shows up.

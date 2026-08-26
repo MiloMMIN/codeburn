@@ -1,8 +1,9 @@
 import { randomBytes } from 'crypto'
 import { existsSync } from 'fs'
 import { mkdir, open, readdir, readFile, rename, stat, unlink } from 'fs/promises'
-import { homedir } from 'os'
 import { join } from 'path'
+
+import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
 // Bumped to 17: copilot CLI sessions were misclassified as VS Code transcripts
@@ -176,10 +177,6 @@ export type DailyCache = {
   watermarkTrusted?: boolean
 }
 
-function getCacheDir(): string {
-  return process.env['CODEBURN_CACHE_DIR'] ?? join(homedir(), '.cache', 'codeburn')
-}
-
 /** IANA name of the current local timezone (respects the TZ env var). Days are
  *  bucketed by local midnight, so this tags the cache for TZ-change invalidation. */
 export function currentTzKey(): string {
@@ -187,7 +184,7 @@ export function currentTzKey(): string {
 }
 
 function getCachePath(): string {
-  return join(getCacheDir(), DAILY_CACHE_FILENAME)
+  return join(getCodeburnCacheDir(), DAILY_CACHE_FILENAME)
 }
 
 /** Absolute path of the active (version-suffixed) daily cache file. */
@@ -379,7 +376,7 @@ function isAdoptableCache(parsed: unknown): parsed is AdoptableCache {
 /// bump lossless: the new version starts from the union of everything every
 /// previous version ever recorded, then re-derives what sources still support.
 async function adoptOlderDailyCaches(): Promise<DailyCache> {
-  const dir = getCacheDir()
+  const dir = getCodeburnCacheDir()
   let names: string[] = []
   try {
     names = await readdir(dir)
@@ -449,7 +446,7 @@ async function adoptOlderDailyCaches(): Promise<DailyCache> {
 }
 
 export async function saveDailyCache(cache: DailyCache): Promise<void> {
-  const dir = getCacheDir()
+  const dir = getCodeburnCacheDir()
   if (!existsSync(dir)) await mkdir(dir, { recursive: true })
   const finalPath = getCachePath()
   const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`

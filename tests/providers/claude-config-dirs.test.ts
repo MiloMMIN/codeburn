@@ -390,6 +390,37 @@ describe('claude provider — config.json claudeConfigDirs (menubar-driven)', ()
     expect(paths).toContain(join(personal, 'projects', '-Users-you-app'))
   })
 
+  it('invalidates the exact parse memo when config.json adds a Claude discovery root', async () => {
+    const work = await makeConfigDir('claude-work', [])
+    const personal = await makeConfigDir('claude-personal', [])
+    const slug = '-Users-you-shared-app'
+    const cwd = '/Users/you/shared-app'
+    await writeSession(work, slug, 'sess-work', [
+      summaryLine('sess-work', cwd),
+      userLine('u1', 'sess-work', cwd, 'hi from work'),
+      assistantLine('a1', 'u1', 'sess-work', cwd),
+    ])
+    await writeSession(personal, slug, 'sess-personal', [
+      summaryLine('sess-personal', cwd),
+      userLine('u2', 'sess-personal', cwd, 'hi from personal'),
+      assistantLine('a2', 'u2', 'sess-personal', cwd),
+    ])
+
+    await writeConfigJson([work])
+    const first = await parseAllSessions(undefined, 'claude')
+    expect(first.flatMap(project => project.sessions).map(session => session.sessionId)).toEqual(['sess-work'])
+
+    // Same argv/date range and unchanged env: only the effective roots sourced
+    // from config.json differ. A resident process must not return the exact-key
+    // memo populated by the first call.
+    await writeConfigJson([work, personal])
+    const second = await parseAllSessions(undefined, 'claude')
+    expect(second.flatMap(project => project.sessions).map(session => session.sessionId).sort()).toEqual([
+      'sess-personal',
+      'sess-work',
+    ])
+  })
+
   it('lets env CLAUDE_CONFIG_DIRS override config.json', async () => {
     const fromEnv = await makeConfigDir('claude-env', ['-Users-you-app'])
     const fromFile = await makeConfigDir('claude-file', ['-Users-you-app'])
