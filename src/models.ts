@@ -517,6 +517,10 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'deepseek-v4.1-flash':               'deepseek-v4-flash',
   'glm-5.2-x':                         'glm-5p1',
   'kimi-k3-1':                         'kimi-k3',
+  'glm-5.1':                           'glm-5p1',
+  'glm-5.2-a':                         'glm-5p1',
+  'glm-5v-turbo':                      'glm-5p1',
+  'kimi-k2.7':                         'kimi-k2p6',
 }
 
 let userAliases: Record<string, string> = {}

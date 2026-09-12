@@ -61,9 +61,20 @@ export function getWorkBuddyHome(config: WorkBuddyConfig): string {
   return join(homedir(), config.defaultDirName)
 }
 
+export function getWorkBuddyProjectsDirs(config: WorkBuddyConfig, homeOverride?: string): string[] {
+  if (homeOverride) return [join(homeOverride, 'projects')]
+  const primary = join(getWorkBuddyHome(config), 'projects')
+  const dirs = [primary]
+  // WorkBuddy historically transitioned from ~/.codebuddy, support it as well
+  if (config.name === 'workbuddy') {
+    const legacy = join(homedir(), '.codebuddy', 'projects')
+    if (legacy !== primary) dirs.push(legacy)
+  }
+  return dirs
+}
+
 export function getWorkBuddyProjectsDir(config: WorkBuddyConfig, homeOverride?: string): string {
-  const base = homeOverride ?? getWorkBuddyHome(config)
-  return join(base, 'projects')
+  return getWorkBuddyProjectsDirs(config, homeOverride)[0]!
 }
 
 export function decodeWorkBuddyProjectPath(slug: string): string {
@@ -346,7 +357,7 @@ function createParser(config: WorkBuddyConfig, source: SessionSource, seenKeys: 
 }
 
 export function createWorkBuddyProvider(config: WorkBuddyConfig, overrideProjectsDir?: string): Provider {
-  const projectsDir = (): string => overrideProjectsDir ?? getWorkBuddyProjectsDir(config)
+  const getDirs = (): string[] => overrideProjectsDir ? [overrideProjectsDir] : getWorkBuddyProjectsDirs(config)
 
   return {
     name: config.name,
@@ -362,26 +373,32 @@ export function createWorkBuddyProvider(config: WorkBuddyConfig, overrideProject
     },
 
     async probeRoots(): Promise<ProbeRoot[]> {
-      return [{ path: projectsDir(), label: 'projects' }]
+      return getDirs().map((d, i) => ({ path: d, label: i === 0 ? 'projects' : 'legacy projects' }))
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
-      const dir = projectsDir()
-      const projectEntries = await readdir(dir, { withFileTypes: true }).catch(() => [])
+      const dirs = getDirs()
       const sources: SessionSource[] = []
+      const seenPaths = new Set<string>()
 
-      for (const projectEntry of projectEntries.sort((a, b) => a.name.localeCompare(b.name))) {
-        if (!projectEntry.isDirectory()) continue
-        const projectDir = join(dir, projectEntry.name)
-        const fileEntries = await readdir(projectDir, { withFileTypes: true }).catch(() => [])
-        for (const fileEntry of fileEntries.sort((a, b) => a.name.localeCompare(b.name))) {
-          if (!fileEntry.isFile()) continue
-          if (!fileEntry.name.endsWith('.jsonl')) continue
-          sources.push({
-            path: join(projectDir, fileEntry.name),
-            project: projectEntry.name,
-            provider: config.name,
-          })
+      for (const dir of dirs) {
+        const projectEntries = await readdir(dir, { withFileTypes: true }).catch(() => [])
+        for (const projectEntry of projectEntries.sort((a, b) => a.name.localeCompare(b.name))) {
+          if (!projectEntry.isDirectory()) continue
+          const projectDir = join(dir, projectEntry.name)
+          const fileEntries = await readdir(projectDir, { withFileTypes: true }).catch(() => [])
+          for (const fileEntry of fileEntries.sort((a, b) => a.name.localeCompare(b.name))) {
+            if (!fileEntry.isFile()) continue
+            if (!fileEntry.name.endsWith('.jsonl')) continue
+            const fullPath = join(projectDir, fileEntry.name)
+            if (seenPaths.has(fullPath)) continue
+            seenPaths.add(fullPath)
+            sources.push({
+              path: fullPath,
+              project: projectEntry.name,
+              provider: config.name,
+            })
+          }
         }
       }
 

@@ -182,6 +182,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // v32: DSH session formats v1-v3 and inclusive reasoning accounting. Re-derive
 // finalized DSH days so migrated generations and retry attempts replace the
 // v0-only totals, and reasoning detail is not added on top of full output.
+// v33: Hermes abnormal estimated_cost_usd sanity check (> $1,000 unscaled raw token credit fallback)
+// and WorkBuddy/WorkBuddy AI provider support.
 export const DAILY_CACHE_VERSION = 32
 const MIN_SUPPORTED_VERSION = 28
 
