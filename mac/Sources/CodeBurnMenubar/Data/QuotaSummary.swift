@@ -4,6 +4,17 @@ import Foundation
 /// Capacity Dock. Every CodeBurn-owned provider adapter normalizes into this
 /// presentation type.
 struct QuotaSummary: Equatable {
+    /// Quota providers use a ten-minute freshness horizon for last-known
+    /// snapshots. A projection from an older sample is misleading even when
+    /// the credentials are still connected, so pace presentation must omit it.
+    static let freshnessThreshold: TimeInterval = 10 * 60
+
+    static func isFresh(fetchedAt: Date?, now: Date = Date()) -> Bool {
+        guard let fetchedAt else { return false }
+        let age = now.timeIntervalSince(fetchedAt)
+        return age.isFinite && age >= 0 && age <= freshnessThreshold
+    }
+
     enum Connection: Equatable {
         case connected
         case disconnected      // no credentials present
@@ -30,6 +41,36 @@ struct QuotaSummary: Equatable {
         let label: String
         let percent: Double           // 0..1
         let resetsAt: Date?
+        /// Length of this window in seconds, carried only from metadata the
+        /// provider service itself validates (Codex's `limitWindowSeconds`,
+        /// Claude's fixed 5-hour/7-day windows). Nil means the duration is not
+        /// known — pace presentation must omit the estimate rather than infer
+        /// a length from the label or the reset date.
+        let windowSeconds: Int?
+        /// Timestamp of the provider sample that produced this window. Nil is
+        /// preserved for legacy/unsupported summaries and is not fresh enough
+        /// to support a pace projection.
+        let fetchedAt: Date?
+
+        init(
+            label: String,
+            percent: Double,
+            resetsAt: Date?,
+            windowSeconds: Int? = nil,
+            fetchedAt: Date? = nil
+        ) {
+            self.label = label
+            self.percent = percent
+            self.resetsAt = resetsAt
+            self.windowSeconds = windowSeconds
+            self.fetchedAt = fetchedAt
+        }
+
+        /// A pace estimate is valid only while the underlying sample remains
+        /// inside the established live-quota freshness horizon.
+        func isFresh(at now: Date = Date()) -> Bool {
+            QuotaSummary.isFresh(fetchedAt: fetchedAt, now: now)
+        }
     }
 
     /// Color band thresholds for the inline chip bar and aggregate menubar
@@ -77,11 +118,16 @@ enum CapacityDockConnectionAction: String, Equatable, Sendable {
     case connect = "Connect"
     case reconnect = "Reconnect"
 
-    var title: String { rawValue }
+    var title: String {
+        switch self {
+        case .connect: L("Connect")
+        case .reconnect: L("Reconnect")
+        }
+    }
 
     func title(for provider: CapacityDockProvider) -> String {
         if provider.catalogEntry.authMethods == [.apiTokenOrCloudCredentials] {
-            return "Add API Key"
+            return L("Add API Key")
         }
         return title
     }
@@ -101,13 +147,14 @@ extension QuotaSummary.Window {
     var resetsInLabel: String {
         guard let resetsAt else { return "" }
         let seconds = max(0, resetsAt.timeIntervalSinceNow)
-        if seconds < 60 { return "now" }
+        if seconds < 60 { return L("now") }
         let minutes = Int(seconds / 60)
         let hours = minutes / 60
         let days = hours / 24
-        if days > 0 { return "\(days)d \(hours % 24)h" }
-        if hours > 0 { return "\(hours)h \(minutes % 60)m" }
-        return "\(minutes)m"
+        // d/h/m are unit abbreviations; zh-Hans uses 天/小时/分.
+        if days > 0 { return L("%lldd %lldh", days, hours % 24) }
+        if hours > 0 { return L("%lldh %lldm", hours, minutes % 60) }
+        return L("%lldm", minutes)
     }
 
     var percentLabel: String {

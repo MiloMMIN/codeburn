@@ -33,7 +33,7 @@ struct AgentTabStrip: View {
                         .buttonStyle(.plain)
                         .foregroundStyle(canMoveBackward ? Color.primary : Color.secondary.opacity(0.35))
                         .disabled(!canMoveBackward)
-                        .help("Show previous providers")
+                        .help(L("Show previous providers"))
                     }
 
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -84,7 +84,7 @@ struct AgentTabStrip: View {
                         .buttonStyle(.plain)
                         .foregroundStyle(canMoveForward ? Color.primary : Color.secondary.opacity(0.35))
                         .disabled(!canMoveForward)
-                        .help("Show next providers")
+                        .help(L("Show next providers"))
                     }
                 }
                 .onAppear {
@@ -345,6 +345,7 @@ private struct AgentTabQuotaBar: View {
 }
 
 private struct QuotaDetailPopover: View {
+    @Environment(AppStore.self) private var store
     let quota: QuotaSummary
 
     var body: some View {
@@ -357,7 +358,7 @@ private struct QuotaDetailPopover: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             case .loading where quota.details.isEmpty:
-                Text("Loading…")
+                Text(L("Loading…"))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             default:
@@ -370,23 +371,30 @@ private struct QuotaDetailPopover: View {
 
     private var disconnectedMessage: String {
         switch quota.providerFilter {
-        case .codex:  return "Sign in with `codex` (ChatGPT mode) to track quota."
-        case .claude: return "Sign in to Claude Code to track quota."
-        default:      return "Sign in to track quota."
+        case .codex:  return L("Sign in with `codex` (ChatGPT mode) to track quota.")
+        case .claude: return L("Sign in to Claude Code to track quota.")
+        default:      return L("Sign in to track quota.")
         }
     }
 
     private var rowsCard: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        // Resolve every window's pace caption once, against this summary's
+        // connection and freshness, so the card and the Capacity Dock cannot
+        // disagree about a window and an exact duplicate is captioned once.
+        let paceLines = QuotaPacePresentation.lines(
+            for: quota.details,
+            connection: quota.connection
+        )
+        return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Text("\(quota.providerFilter.rawValue) usage")
+                Text(L("%@ usage", quota.providerFilter.displayLabel))
                     .font(.system(size: 11, weight: .semibold))
                 if case .stale = quota.connection {
-                    Text("stale")
+                    Text(L("stale"))
                         .font(.system(size: 9.5))
                         .foregroundStyle(.secondary)
                 } else if case .transientFailure = quota.connection {
-                    Text("retrying")
+                    Text(L("retrying"))
                         .font(.system(size: 9.5))
                         .foregroundStyle(.orange)
                 }
@@ -409,8 +417,19 @@ private struct QuotaDetailPopover: View {
                         .fixedSize(horizontal: true, vertical: false)
                 }
             }
-            ForEach(Array(quota.details.enumerated()), id: \.offset) { _, w in
-                QuotaDetailRow(window: w)
+            ForEach(Array(quota.details.enumerated()), id: \.offset) { index, w in
+                QuotaDetailRow(window: w, paceLine: paceLines[index])
+            }
+            // What this Mac has seen of the provider's own reset timing, next to
+            // the pace captions. Derived from the snapshots already on disk.
+            let earlyResetLines = store.earlyResetHistoryCaptions(for: quota.providerFilter)
+            if !earlyResetLines.isEmpty {
+                ForEach(Array(earlyResetLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .help(L("Derived from this Mac's own record of past quota windows for this provider. Local only — nothing is fetched to produce it."))
+                }
             }
             if !quota.footerLines.isEmpty {
                 Divider()
@@ -446,30 +465,65 @@ private struct QuotaDetailPopover: View {
 
 private struct QuotaDetailRow: View {
     let window: QuotaSummary.Window
+    /// Whether this window lasts to its reset, already resolved against the
+    /// summary's connection and sample freshness by `QuotaPacePresentation`.
+    /// Nil means the row says nothing at all: this card is fitted, so a silent
+    /// caption collapses rather than leaving a gap — unlike the Capacity Dock,
+    /// whose frame is computed and therefore reserves the slot either way.
+    let paceLine: QuotaPacePresentation.Line?
+
+    /// The label column's width. The caption hangs under the bar, so it is
+    /// indented past the label by this plus the row's own spacing.
+    private static let labelWidth: CGFloat = 92
+    private static let rowSpacing: CGFloat = 8
 
     var body: some View {
-        HStack(spacing: 8) {
-            Text(window.label)
-                .font(.system(size: 10.5))
-                .frame(width: 92, alignment: .leading)
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.secondary.opacity(0.18))
-                    Capsule()
-                        .fill(barColor)
-                        .frame(width: max(2, geo.size.width * CGFloat(min(max(window.percent, 0), 1))))
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: Self.rowSpacing) {
+                Text(window.label)
+                    .font(.system(size: 10.5))
+                    .frame(width: Self.labelWidth, alignment: .leading)
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.secondary.opacity(0.18))
+                        Capsule()
+                            .fill(barColor)
+                            .frame(width: max(2, geo.size.width * CGFloat(min(max(window.percent, 0), 1))))
+                    }
+                }
+                .frame(height: 4)
+                Text(window.percentLabel)
+                    .font(.codeMono(size: 10.5, weight: .medium))
+                    .frame(width: 36, alignment: .trailing)
+                if !window.resetsInLabel.isEmpty {
+                    Text(window.resetsInLabel)
+                        .font(.codeMono(size: 10))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 50, alignment: .trailing)
                 }
             }
-            .frame(height: 4)
-            Text(window.percentLabel)
-                .font(.codeMono(size: 10.5, weight: .medium))
-                .frame(width: 36, alignment: .trailing)
-            if !window.resetsInLabel.isEmpty {
-                Text(window.resetsInLabel)
-                    .font(.codeMono(size: 10))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 50, alignment: .trailing)
+            if let paceLine {
+                Text(paceLine.text)
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(paceTint)
+                    .lineLimit(1)
+                    .padding(.leading, Self.labelWidth + Self.rowSpacing)
+                    .help(paceLine.helpText)
+                    .accessibilityLabel(paceLine.text)
+                    .accessibilityHint(paceLine.helpText)
             }
+        }
+    }
+
+    /// Muted while the pace is healthy, amber for a deficit or a projected
+    /// overflow, red once the limit is actually reached — the same three
+    /// tones the dock's caption uses, so one surface cannot look calmer than
+    /// the other about the same window.
+    private var paceTint: AnyShapeStyle {
+        switch paceLine?.tone {
+        case .danger:  return AnyShapeStyle(Color.red.opacity(0.92))
+        case .warning: return AnyShapeStyle(Color.orange)
+        default:       return AnyShapeStyle(.tertiary)
         }
     }
 

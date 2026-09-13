@@ -11,14 +11,17 @@ import { getProvider } from './providers/index.js'
 import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
-import { DAILY_CACHE_VERSION, toDateString } from './daily-cache.js'
+import { toDateString } from './daily-cache.js'
+import { statusSnapshotSemanticKey } from './status-snapshot-semantic.js'
 import { dateKey } from './day-aggregator.js'
-import { sessionModelBillableOutputTokens } from './session-output.js'
+import { sessionModelBillableOutputTokens, inferSessionProvider } from './session-output.js'
 import { isBehavioralCall } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import type { AppliedFix } from './act/types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, type DurablePeriod } from './usage-aggregator.js'
+import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, getDailyCacheConfigHash, type DurablePeriod } from './usage-aggregator.js'
+import { aggregateProjectsIntoDays } from './day-aggregator.js'
+import { buildPeriodDiffReport, defaultSevenDayRanges, diffSessions, dayKeyToRange, historyBasis, localRangeInfo } from './period-diff.js'
 import { loadStatusSnapshot, saveStatusSnapshot } from './session-cache.js'
 import { renderDashboard } from './dashboard.js'
 import { renderOverview } from './overview.js'
@@ -54,20 +57,10 @@ import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 const { version } = require('../package.json')
-// Bump when the menubar payload's rendering semantics change without a package
-// release or daily-cache version change. The envelope version in session-cache
-// protects record shape; this protects the meaning of an otherwise valid one.
-// v5: providerDetails carries per-provider tokens and sessions, which a v4
-// record predates — the dock glance would read a provider as having no token
-// breakdown purely because the snapshot was written before this build.
-// v6: sessionCountBasis is now part of payload meaning. A same-package v5
-// snapshot written before that field existed still matches the v5 semantic
-// key; omitting it makes empty identity-0 read as undefined-0 ("unavailable")
-// and nonempty exact counts as a bound. Daily and session cache versions stay
-// put: retained unknown accounting must remain a partial bound, not be
-// discarded to regain exact labels.
-const STATUS_SNAPSHOT_RENDER_VERSION = 6
-const STATUS_SNAPSHOT_SEMANTIC_KEY = `${version}:render-${STATUS_SNAPSHOT_RENDER_VERSION}:daily-${DAILY_CACHE_VERSION}`
+// The snapshot semantic revision + key live in their own module so the CLI's
+// snapshot read/write path and its regression tests agree on the same value
+// without importing the CLI entry point (which parses argv as a side effect).
+const STATUS_SNAPSHOT_SEMANTIC_KEY = statusSnapshotSemanticKey(version)
 import { loadCurrency, getCurrency, isValidCurrencyCode } from './currency.js'
 import { sessionCountIsExact } from './session-count-label.js'
 import { CodexThroughputReader, newestCodexSession, renderCodexThroughput } from './codex-throughput.js'
@@ -458,6 +451,15 @@ function assertFormat(value: string, allowed: readonly string[], command: string
   }
 }
 
+/** Task-category ids (types.ts CATEGORY_LABELS keys), shared with `--task`. */
+function assertCategory(value: string): void {
+  if (value in CATEGORY_LABELS) return
+  process.stderr.write(
+    `codeburn: unknown category "${value}". Valid values: ${Object.keys(CATEGORY_LABELS).join(', ')}.\n`
+  )
+  process.exit(1)
+}
+
 type AliasRow = { from: string; to: string }
 
 function toAliasRows(aliases: Record<string, string>): AliasRow[] {
@@ -668,6 +670,7 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
     .sort(([, a], [, b]) => (b.cost + b.savings) - (a.cost + a.savings))
     .map(([cat, d]) => ({
       category: CATEGORY_LABELS[cat as TaskCategory] ?? cat,
+      rawCategory: cat,
       cost: convertCost(d.cost),
       savings: convertCost(d.savings),
       turns: d.turns,
@@ -722,6 +725,8 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
     .flatMap(p => p.sessions.map(s => ({
       project: p.project,
       sessionId: s.sessionId,
+      provider: inferSessionProvider(s),
+      projectKey: s.project || p.project,
       date: s.firstTimestamp ? dateKey(s.firstTimestamp) : null,
       cost: convertCost(s.totalCostUSD),
       savings: convertCost(s.totalSavingsUSD),
@@ -2236,16 +2241,70 @@ program
   .description('Compare two AI models side-by-side')
   .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all, lifetime', 'all')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, gemini, cursor, copilot)', 'all')
-  .option('--format <format>', 'Output format: tui, json', 'tui')
+  .option('--format <format>', 'Output format: tui, json, cohort-json', 'tui')
   .option('--model-a <model>', 'First model to compare')
   .option('--model-b <model>', 'Second model to compare')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
+  .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
+  .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
+  .option('--category <category>', 'cohort-json only: keep edit-turn observations of one activity category')
+  .option('--project-id <id>', 'cohort-json only: exact canonical project identity (repeatable)', collect, [])
   .action(async (opts) => {
     assertProvider(opts.provider, 'compare')
-    assertFormat(opts.format, ['tui', 'json'], 'compare')
+    assertFormat(opts.format, ['tui', 'json', 'cohort-json'], 'compare')
+    if (opts.projectId.length > 0 && opts.format !== 'cohort-json') {
+      process.stderr.write('codeburn compare: --project-id requires --format cohort-json.\n')
+      process.exit(1)
+    }
     await loadPricing()
-    const { range, label } = getDateRange(opts.period)
+    let customRange: DateRange | null = null
+    try {
+      customRange = parseDateRangeFlags(opts.from, opts.to)
+    } catch (err) {
+      console.error(`\n  Error: ${err instanceof Error ? err.message : String(err)}\n`)
+      process.exit(1)
+    }
+    const { range, label } = customRange
+      ? { range: customRange, label: formatDateRangeLabel(opts.from, opts.to) }
+      : getDateRange(opts.period)
+    if (opts.format === 'cohort-json') {
+      if (opts.category !== undefined) assertCategory(opts.category)
+      const { aggregateModelStats, buildCohortComparison, buildCohortFacets, findModelStat, renderCohortJson, selectCohortProjects } = await import('./compare-cohorts.js')
+      const parsed = await parseAllSessions(range, opts.provider)
+      await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+      const projects = selectCohortProjects(filterProjectsByName(parsed, opts.project, opts.exclude), opts.projectId)
+
+      // Without --model-a/--model-b the cohort format answers the FACET query:
+      // the models, canonical project identities, and activity categories the
+      // desktop cohort pickers are built from (one parse, one contract).
+      if (!opts.modelA && !opts.modelB) {
+        process.stdout.write(renderCohortJson(buildCohortFacets(projects)) + '\n')
+        return
+      }
+      if (!opts.modelA || !opts.modelB) {
+        process.stderr.write('codeburn compare: --model-a and --model-b must be provided together.\n')
+        process.exit(1)
+      }
+      // Resolve against the same period/provider population as the desktop
+      // model picker. A selected project may have zero work for either model.
+      const models = aggregateModelStats(parsed)
+      const modelA = findModelStat(models, opts.modelA)
+      const modelB = findModelStat(models, opts.modelB)
+      if (!modelA) {
+        process.stderr.write(`codeburn compare: model not found: "${opts.modelA}".\n`)
+        process.exit(1)
+      }
+      if (!modelB) {
+        process.stderr.write(`codeburn compare: model not found: "${opts.modelB}".\n`)
+        process.exit(1)
+      }
+      process.stdout.write(renderCohortJson(buildCohortComparison(
+        projects, modelA.model, modelB.model, label, opts.provider,
+        { category: opts.category as TaskCategory | undefined, from: opts.from ?? null, to: opts.to ?? null },
+      )) + '\n')
+      return
+    }
     if (opts.format === 'json') {
       const { aggregateModelStats, buildCompareJson, findModelStat, projectSessionIds, renderCompareJson, scanSelfCorrections } = await import('./compare-stats.js')
       const parsed = await parseAllSessions(range, opts.provider)
@@ -2293,6 +2352,128 @@ program
       }
     }
     await renderCompare(range, opts.provider, opts.modelA, opts.modelB, opts.project, opts.exclude)
+  })
+
+program
+  .command('compare-periods')
+  .description('Compare usage and cost between two periods (B minus A: B is analyzed, A is the reference)')
+  .option('--from-a <date>', 'Reference period A start (YYYY-MM-DD)')
+  .option('--to-a <date>', 'Reference period A end (YYYY-MM-DD)')
+  .option('--from-b <date>', 'Analyzed period B start (YYYY-MM-DD)')
+  .option('--to-b <date>', 'Analyzed period B end (YYYY-MM-DD)')
+  .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
+  .option('--format <format>', 'Output format: json, sessions', 'json')
+  .option('--dimension <dimension>', 'Drill-down dimension for --format sessions: project, model')
+  .option('--key <key>', 'Canonical contribution key for --format sessions (project path or model id from the report)')
+  .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
+  .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
+  .option('--no-with-history', 'Skip the durable daily-history cross-check (aggregate-only carried days)')
+  .action(async (opts) => {
+    assertProvider(opts.provider, 'compare-periods')
+    assertFormat(opts.format, ['json', 'sessions'], 'compare-periods')
+
+    // Explicit ranges must come as two complete pairs; otherwise the default
+    // horizon is the last seven complete local days (B) vs the seven before
+    // (A). Same local-date conventions as --from/--to everywhere else.
+    const flagsGiven = [opts.fromA, opts.toA, opts.fromB, opts.toB].filter(v => v !== undefined)
+    let keyRangeA: DateRange
+    let keyRangeB: DateRange
+    if (flagsGiven.length > 0) {
+      if (flagsGiven.length !== 4) {
+        process.stderr.write('codeburn compare-periods: --from-a/--to-a/--from-b/--to-b must be provided together.\n')
+        process.exit(1)
+      }
+      // parseDateRangeFlags THROWS on a bad date (it never returns null for a
+      // provided pair), so the same try/catch every other date-flag command
+      // uses is what turns that into one clean line instead of a stack trace.
+      try {
+        keyRangeA = parseDateRangeFlags(opts.fromA, opts.toA)!
+        keyRangeB = parseDateRangeFlags(opts.fromB, opts.toB)!
+      } catch (err) {
+        console.error(`\n  Error: ${err instanceof Error ? err.message : String(err)}\n`)
+        process.exit(1)
+      }
+    } else {
+      const defaults = defaultSevenDayRanges()
+      keyRangeA = dayKeyToRange(defaults.A.from, defaults.A.to)
+      keyRangeB = dayKeyToRange(defaults.B.from, defaults.B.to)
+    }
+
+    if (opts.format === 'sessions') {
+      const dimension = opts.dimension
+      if (dimension !== 'project' && dimension !== 'model') {
+        process.stderr.write('codeburn compare-periods: --dimension must be "project" or "model" for --format sessions.\n')
+        process.exit(1)
+      }
+      if (!opts.key) {
+        process.stderr.write('codeburn compare-periods: --key is required for --format sessions.\n')
+        process.exit(1)
+      }
+      await loadPricing()
+      const [parsedSessionsA, parsedSessionsB] = await Promise.all([
+        parseAllSessions(keyRangeA, opts.provider),
+        parseAllSessions(keyRangeB, opts.provider),
+      ])
+      // Same project filter as the report: a drill-down must never surface a
+      // session from a project the active filter hides.
+      const projectsA = filterProjectsByName(parsedSessionsA, opts.project, opts.exclude)
+      const projectsB = filterProjectsByName(parsedSessionsB, opts.project, opts.exclude)
+      process.stdout.write(JSON.stringify({
+        dimension,
+        key: opts.key,
+        provider: opts.provider,
+        rangeA: localRangeInfo(keyRangeA),
+        rangeB: localRangeInfo(keyRangeB),
+        sessions: diffSessions(projectsA, projectsB, dimension, opts.key),
+      }, null, 2) + '\n')
+      return
+    }
+
+    await loadPricing()
+    const [parsedA, parsedB] = await Promise.all([
+      parseAllSessions(keyRangeA, opts.provider),
+      parseAllSessions(keyRangeB, opts.provider),
+    ])
+    await reportUnmatchedProjectPatterns([...parsedA, ...parsedB], opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(keyRangeB))
+    const projectsA = filterProjectsByName(parsedA, opts.project, opts.exclude)
+    const projectsB = filterProjectsByName(parsedB, opts.project, opts.exclude)
+
+    // Cross-check the durable daily history so usage whose sources aged off
+    // disk (aggregate-only carried days) is visible instead of silently
+    // missing from a transcript-based report. Best-effort: an unavailable
+    // daily cache degrades to the report's explicit "detail only" basis note.
+    let history
+    if (opts.withHistory) {
+      try {
+        const { ensureCacheHydrated } = await import('./daily-cache.js')
+        const cache = await ensureCacheHydrated(
+          range => parseAllSessions(range, 'all'),
+          aggregateProjectsIntoDays,
+          getDailyCacheConfigHash(),
+          isSessionHydrationComplete,
+        )
+        history = historyBasis(
+          cache,
+          localRangeInfo(keyRangeA),
+          localRangeInfo(keyRangeB),
+          opts.provider,
+          aggregateProjectsIntoDays(projectsA),
+          aggregateProjectsIntoDays(projectsB),
+        )
+      } catch (err) {
+        process.stderr.write(`codeburn compare-periods: daily history check skipped (${err instanceof Error ? err.message : String(err)}).\n`)
+      }
+    }
+
+    const report = buildPeriodDiffReport({
+      provider: opts.provider,
+      rangeA: localRangeInfo(keyRangeA),
+      rangeB: localRangeInfo(keyRangeB),
+      projectsA,
+      projectsB,
+      history,
+    })
+    process.stdout.write(JSON.stringify(report, null, 2) + '\n')
   })
 
 program
@@ -2450,12 +2631,17 @@ program
   .option('--format <format>', 'Output format: table, json', 'table')
   .option('--by-pr', 'Group spend by the pull requests each session referenced')
   .option('--by-work-unit', 'Group sessions into provider-recorded work units: one row per orchestration root with its delegated children folded beneath')
+  .option('--contributions', 'JSON only: attach per-session contribution segments (day, category, branch, model, PR) to each row')
   .option('--no-pager', 'Print the complete table directly instead of opening the interactive browser')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
   .action(async (opts) => {
     assertProvider(opts.provider, 'sessions')
     assertFormat(opts.format, ['table', 'json'], 'sessions')
+    if (opts.contributions && (opts.byPr || opts.byWorkUnit || opts.format !== 'json')) {
+      process.stderr.write('codeburn: --contributions requires plain --format json (no --by-pr/--by-work-unit)\n')
+      process.exit(1)
+    }
     const { aggregateSessions, buildPrAttribution, renderJson, renderTable, renderWorkUnitJson, renderWorkUnitTable } = await import('./sessions-report.js')
     const wantsInteractive = opts.format === 'table' && !opts.byPr && !opts.byWorkUnit && opts.pager !== false && process.stdin.isTTY === true && process.stdout.isTTY === true
     if (wantsInteractive) setInteractiveScanUI()
@@ -2525,6 +2711,11 @@ program
       return
     }
     const rows = aggregateSessions(projects)
+    if (opts.contributions) {
+      const { withContributions } = await import('./session-contributions.js')
+      process.stdout.write(JSON.stringify(withContributions(rows, projects), null, 2) + '\n')
+      return
+    }
     if (opts.byWorkUnit) {
       const { resolveWorkUnits } = await import('./work-units.js')
       const { inferSessionProvider } = await import('./session-output.js')
@@ -2585,11 +2776,11 @@ program
   .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
   .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
-  .option('--format <format>', 'Output format: flow-json', 'flow-json')
+  .option('--format <format>', 'Output format: flow-json, branch-json', 'flow-json')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
   .action(async (opts) => {
-    assertFormat(opts.format, ['flow-json'], 'spend')
+    assertFormat(opts.format, ['flow-json', 'branch-json'], 'spend')
     assertProvider(opts.provider, 'spend')
     const { computeSpendFlow } = await import('./spend-flow.js')
     await loadPricing()
@@ -2605,6 +2796,13 @@ program
       }
     } else {
       range = getDateRange(opts.period).range
+    }
+
+    if (opts.format === 'branch-json') {
+      // Spend per canonical project x branch (the desktop "By branch" lens).
+      const { computeBranchSpend } = await import('./branch-spend.js')
+      console.log(JSON.stringify(await computeBranchSpend(range, opts.provider, opts.project, opts.exclude)))
+      return
     }
 
     console.log(JSON.stringify(await computeSpendFlow(range, opts.provider, opts.project, opts.exclude)))

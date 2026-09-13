@@ -286,6 +286,25 @@ function vRange(range: DateRange | undefined): DateRange | undefined {
   }
   return range
 }
+/**
+ * Drill-down contribution key (canonical project path or model id). Unlike
+ * vToken, a leading '-' is legal here: Claude sanitizes project paths by
+ * replacing separators with '-' (e.g. `/work/pricing` → `-work-pricing`), and
+ * the key is only ever emitted in the VALUE position of `--key`/`--dimension`
+ * pairs, where Commander binds the next token as the value — a dash-leading
+ * value cannot inject a flag through the argv array (no shell involved).
+ * Empty and NUL are still rejected.
+ */
+function vContributionKey(value: string): string {
+  if (!value || value.includes('\0')) throw new CliError('bad-args', 'invalid contribution key')
+  return value
+}
+/** vRange for channels where the range is REQUIRED (compare periods). */
+function vRequiredRange(range: DateRange | undefined, name: string): DateRange {
+  const v = vRange(range)
+  if (!v) throw new CliError('bad-args', `missing ${name} date range`)
+  return v
+}
 function vCurrency(code: string): string {
   if (!/^[A-Z]{3}$/.test(code)) throw new CliError('bad-args', 'invalid currency code')
   return code
@@ -294,6 +313,29 @@ function vCurrency(code: string): string {
 function vToken(value: string): string {
   if (value.startsWith('-')) throw new CliError('bad-args', 'argument must not start with "-"')
   return value
+}
+// Exact identities from the cohort facet report, not loose CLI patterns.
+// Keep the value attached to its flag so label-only ids starting with "-"
+// remain data; NUL is invalid in process argv.
+function vProjectIds(projects: string[] | undefined): string[] {
+  if (!projects || projects.length === 0) return []
+  for (const pattern of projects) {
+    if (typeof pattern !== 'string' || pattern.length === 0 || pattern.includes('\0')) {
+      throw new CliError('bad-args', 'invalid project identity')
+    }
+  }
+  return projects.map(id => `--project-id=${id}`)
+}
+// Activity categories for the cohort selection: the ids behind the CLI's
+// --category (src/types.ts CATEGORY_LABELS keys). Duplicated here because the
+// main process deliberately does not import core src/ modules.
+const COHORT_CATEGORIES = new Set([
+  'coding', 'debugging', 'feature', 'refactoring', 'testing', 'exploration',
+  'planning', 'delegation', 'git', 'build/deploy', 'conversation', 'brainstorming', 'general',
+])
+function vCategory(category: string): string {
+  if (!COHORT_CATEGORIES.has(category)) throw new CliError('bad-args', 'invalid category')
+  return category
 }
 // Claude config source ids are `<kind>:<hex>` (src/providers/claude.ts) — the
 // colon is part of the real value, so the token class allows it while anchoring
@@ -541,6 +583,15 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
       ...projectArgs(),
       ...rangeArgs(vRange(range)),
     ], 3),
+    // Drill-through report: plain session rows plus per-turn contribution
+    // segments (day/category/branch/model/PR). Same filtering semantics as
+    // getSessions — one filtering mechanism, additive payload fields only.
+    'codeburn:getSessionsContributions': run((period: string, provider: string, range?: DateRange) => [
+      'sessions', '--format', 'json', '--contributions', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      ...rangeArgs(vRange(range)),
+    ], 3),
     'codeburn:getCompareModels': run((period: string, provider: string) => [
       'compare', '--format', 'json', '--period', vPeriod(period),
       ...providerArgs(vProvider(provider)),
@@ -552,6 +603,41 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
       ...projectArgs(),
       '--model-a', vToken(modelA), '--model-b', vToken(modelB),
     ]),
+    // Compare periods (B minus A). Both ranges are REQUIRED local YYYY-MM-DD
+    // key pairs; the renderer computes the 7v7 default so argv stays explicit.
+    'codeburn:getPeriodCompare': run((rangeA: DateRange, rangeB: DateRange, provider: string, background?: boolean) => [
+      'compare-periods', '--format', 'json',
+      '--from-a', vRequiredRange(rangeA, 'A').from, '--to-a', vRequiredRange(rangeA, 'A').to,
+      '--from-b', vRequiredRange(rangeB, 'B').from, '--to-b', vRequiredRange(rangeB, 'B').to,
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+    ], 3),
+    'codeburn:getPeriodCompareSessions': run((rangeA: DateRange, rangeB: DateRange, provider: string, dimension: string, key: string) => {
+      if (dimension !== 'project' && dimension !== 'model') throw new CliError('bad-args', 'invalid drill-down dimension')
+      return [
+        'compare-periods', '--format', 'sessions',
+        '--from-a', vRequiredRange(rangeA, 'A').from, '--to-a', vRequiredRange(rangeA, 'A').to,
+        '--from-b', vRequiredRange(rangeB, 'B').from, '--to-b', vRequiredRange(rangeB, 'B').to,
+        ...providerArgs(vProvider(provider)),
+        ...projectArgs(),
+        '--dimension', dimension, '--key', vContributionKey(key),
+      ]
+    }),
+    // Cohort mode: the facet query (models/projects/categories) and the report
+    // for two models over an explicit selection. Same `compare` command, new
+    // cohort-json format; project identities are exact, category is one id.
+    'codeburn:getCompareCohortModels': run((period: string, provider: string, range?: DateRange) => [
+      'compare', '--format', 'cohort-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)),
+      ...projectArgs(), ...rangeArgs(vRange(range)),
+    ], 3),
+    // The saved project filter still scopes the population; --project-id then
+    // narrows it further to one identity the facet report offered.
+    'codeburn:getCompareCohort': run((period: string, provider: string, modelA: string, modelB: string, range?: DateRange, projects?: string[], category?: string) => [
+      'compare', '--format', 'cohort-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      '--model-a', vToken(modelA), '--model-b', vToken(modelB), ...rangeArgs(vRange(range)),
+      ...(vProjectIds(projects)), ...(category ? ['--category', vCategory(category)] : []),
+    ], 7),
     'codeburn:getYield': run((period: string, provider: string, range?: DateRange) => [
       'yield', '--format', 'json', '--period', vPeriod(period),
       ...providerArgs(vProvider(provider)),
@@ -560,6 +646,14 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     ], 3),
     'codeburn:getSpendFlow': run((period: string, provider: string, range?: DateRange) => [
       'spend', '--format', 'flow-json', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      ...rangeArgs(vRange(range)),
+    ], 3),
+    // Spend "By branch" lens: spend per canonical project × branch (plus
+    // coverage for sources without branch metadata).
+    'codeburn:getBranchSpend': run((period: string, provider: string, range?: DateRange) => [
+      'spend', '--format', 'branch-json', '--period', vPeriod(period),
       ...providerArgs(vProvider(provider)),
       ...projectArgs(),
       ...rangeArgs(vRange(range)),

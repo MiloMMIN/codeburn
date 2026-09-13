@@ -74,11 +74,51 @@ struct CodexUsage: Sendable, Equatable {
     }
 
     /// Account-level limit-reset credits: grants that restore a rate-limit
-    /// window early, each with its own expiry. Only what the popover renders —
-    /// the available count and the soonest expiry among available credits.
+    /// window early, each with its own expiry. Carries what the popover renders
+    /// (the available count and the soonest expiry among available credits) plus
+    /// the per-credit identities a newly banked grant is detected from.
     struct ResetCredits: Sendable, Equatable {
+        /// One available credit, reduced to the three things a notice needs.
+        struct Grant: Sendable, Equatable, Codable {
+            /// Stable identity: the payload's `id`, else its raw `granted_at`
+            /// string. A credit carrying neither is left out entirely — it
+            /// cannot be told apart from the next one, so it must never be
+            /// announced as new.
+            let id: String
+            /// `reset_type` verbatim ("weekly", …). Nil when the payload omits it.
+            let resetType: String?
+            let grantedAt: Date?
+        }
+
         let availableCount: Int
+        /// `applicable_available_count`: how many of the available credits can be
+        /// applied right now. Nil when the payload omits it — which is not the
+        /// same as zero, so it is never defaulted.
+        let applicableAvailableCount: Int?
+        /// Available credits that carry a stable identity, in payload order.
+        let grants: [Grant]
         let nextExpiresAt: Date?
+
+        init(
+            availableCount: Int,
+            applicableAvailableCount: Int? = nil,
+            grants: [Grant] = [],
+            nextExpiresAt: Date? = nil
+        ) {
+            self.availableCount = availableCount
+            self.applicableAvailableCount = applicableAvailableCount
+            self.grants = grants
+            self.nextExpiresAt = nextExpiresAt
+        }
+
+        /// The most recently granted credit. Only credits that say when they were
+        /// granted can compete: "most recent" is a claim about time, and a credit
+        /// with no timestamp cannot support it.
+        var latestGrant: Grant? {
+            grants
+                .filter { $0.grantedAt != nil }
+                .max { ($0.grantedAt ?? .distantPast) < ($1.grantedAt ?? .distantPast) }
+        }
     }
 
     /// The monthly allowance an admin sets. Credit-metered workspaces report
@@ -105,12 +145,14 @@ struct CodexUsage: Sendable, Equatable {
             func text(_ value: Double) -> String {
                 formatter.string(from: NSNumber(value: value)) ?? "\(Int(value.rounded()))"
             }
-            let base = "Monthly usage limit · \(text(used)) / \(text(limit)) credits"
-            return reached ? "\(base) · limit reached" : base
+            // The two figures are already grouped by the formatter above, so
+            // they are substituted formatted and only the sentence is translated.
+            let base = L("Monthly usage limit · %@ / %@ credits", text(used), text(limit))
+            return reached ? L("%@ · limit reached", base) : base
         }
 
         var shortLabel: String {
-            reached ? "Monthly usage limit · limit reached" : "Monthly usage limit"
+            reached ? L("Monthly usage limit · limit reached") : L("Monthly usage limit")
         }
     }
 

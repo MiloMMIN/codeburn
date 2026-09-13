@@ -7,7 +7,8 @@ import { sanitizeProps } from '../electron/telemetry'
 import { __resetPolledMemo, hasPolledMemo, primePolledMemo } from './hooks/usePolled'
 import { setActiveCurrency } from './lib/format'
 import { readOverviewHeadline, writeOverviewHeadline } from './lib/overviewSnapshot'
-import type { DateRange, MenubarPayload, ModelReportRow, OptimizeJsonReport, SpendFlow } from './lib/types'
+import type { BranchSpendReport, DateRange, MenubarPayload, ModelReportRow, OptimizeJsonReport, SessionRow, SpendFlow } from './lib/types'
+import { INITIAL_VISIBLE } from './sections/Sessions'
 
 const stored = new Map<string, string>()
 vi.stubGlobal('localStorage', {
@@ -22,6 +23,7 @@ vi.stubGlobal('localStorage', {
 const mocks = vi.hoisted(() => ({
   getOverview: vi.fn<(period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string) => Promise<MenubarPayload>>(),
   getSpendFlow: vi.fn<(period: string, provider: string, range?: DateRange, background?: boolean) => Promise<SpendFlow>>(),
+  getBranchSpend: vi.fn<(period: string, provider: string, range?: DateRange, background?: boolean) => Promise<BranchSpendReport>>(),
   getTimeline: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<MenubarPayload>>(),
   getOptimizeReport: vi.fn<(period: string, provider: string, range?: DateRange, background?: boolean) => Promise<OptimizeJsonReport>>(),
   getModels: vi.fn(),
@@ -138,6 +140,11 @@ function installDefaultMocks() {
   mocks.getOverview.mockResolvedValue(overviewPayload())
   mocks.getTimeline.mockResolvedValue(overviewPayload())
   mocks.getSpendFlow.mockResolvedValue({ period: { label: 'Last 30 days', start: '', end: '' }, models: [], projects: [], links: [] })
+  mocks.getBranchSpend.mockResolvedValue({
+    period: { label: '', start: '', end: '' },
+    projects: [],
+    totals: { branchKnownCost: 0, branchUnknownCost: 0, noBranchDataCost: 0, noBranchDataSessions: 0, noBranchDataProviders: [], distinctSessions: 0 },
+  })
   mocks.getOptimizeReport.mockResolvedValue({
     period: { label: 'Last 30 days', start: null, end: null },
     summary: {
@@ -396,7 +403,7 @@ describe('App shortcuts', () => {
     render(<App />)
 
     expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
-    expect(screen.getByText(`${mod}1-8`)).toBeInTheDocument()
+    expect(screen.getByText(`${mod}1-8,9`)).toBeInTheDocument()
     expect(screen.getAllByText(`${mod},`).length).toBeGreaterThan(0)
     expect(screen.getByText(`${mod}R`)).toBeInTheDocument()
     expect(screen.queryByText('Command')).not.toBeInTheDocument()
@@ -1342,5 +1349,59 @@ describe('usage_snapshot telemetry props', () => {
       { name: 'coding', oneShotRate: 0.61 },
       { name: 'debugging', oneShotRate: -1 },
     ])
+  })
+})
+
+describe('sessions pagination', () => {
+  beforeEach(() => {
+    installDefaultMocks()
+    localStorage.clear()
+    localStorage.setItem('codeburn.defaultPeriod', '30days')
+    setPlatform('darwin')
+  })
+
+  afterEach(() => {
+    clearPlatform()
+    vi.useRealTimers()
+  })
+
+  function sessionRows(count: number): SessionRow[] {
+    return Array.from({ length: count }, (_, index) => ({
+      sessionId: `session-${index}`,
+      project: `project-${index}`,
+      provider: 'claude',
+      models: ['Opus 4.8'],
+      cost: count - index,
+      savingsUSD: 0,
+      calls: 1,
+      turns: 1,
+      inputTokens: 1_000,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      startedAt: '2026-09-10T10:00:00.000Z',
+      endedAt: '2026-09-10T10:01:00.000Z',
+      durationMs: 60_000,
+    }))
+  }
+
+  // 30s timeout: the list renders 120+ rows three times inside a full App
+  // render, and the suite runs its files in parallel.
+  it('returns a revealed sessions list to the first page when the sort changes', { timeout: 30_000 }, async () => {
+    mocks.getSessions.mockResolvedValue(sessionRows(INITIAL_VISIBLE + 5))
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: '2', metaKey: true })
+    expect(await screen.findByText(`Showing ${INITIAL_VISIBLE} of ${INITIAL_VISIBLE + 5}`)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 5 more · 5 remaining' }))
+    expect(await screen.findByText(`Showing ${INITIAL_VISIBLE + 5} of ${INITIAL_VISIBLE + 5}`)).toBeInTheDocument()
+
+    // A new sort is a new ordering of the whole list: it starts at the first
+    // page again instead of holding the depth reached under the old one.
+    const toolbar = document.querySelector('.sessions-toolbar') as HTMLElement
+    fireEvent.click(within(toolbar).getByRole('tab', { name: 'Recent' }))
+    expect(await screen.findByText(`Showing ${INITIAL_VISIBLE} of ${INITIAL_VISIBLE + 5}`)).toBeInTheDocument()
   })
 })

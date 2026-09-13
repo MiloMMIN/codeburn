@@ -6,6 +6,13 @@ import { spawnSync } from 'node:child_process'
 
 import { describe, expect, it, vi } from 'vitest'
 import { CACHE_SCHEMA_VERSION } from '../src/models.js'
+import { STATUS_SNAPSHOT_RENDER_VERSION } from '../src/status-snapshot-semantic.js'
+
+// Derive the revision tags rather than hard-coding them: a snapshot revision
+// bump on one branch would otherwise leave another branch's assertion pinned
+// to a stale literal that still auto-merges cleanly.
+const CURRENT_RENDER_TAG = `:render-${STATUS_SNAPSHOT_RENDER_VERSION}:`
+const PREVIOUS_RENDER_TAG = `:render-${STATUS_SNAPSHOT_RENDER_VERSION - 1}:`
 
 // Each distinct query gets its own `status-snapshot.<queryKeyHash>.json` file
 // rather than one shared fixed path — these tests
@@ -910,6 +917,125 @@ describe('codeburn status --format menubar-json', () => {
     }
   })
 
+  it('carries per-provider cache read through the parse path', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-cache-read-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts1 = base.toISOString().replace(/\.\d+Z$/, 'Z')
+      const ts2 = new Date(base.getTime() + 60_000).toISOString().replace(/\.\d+Z$/, 'Z')
+
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [
+          userLine('s1', ts1),
+          JSON.stringify({
+            type: 'assistant',
+            sessionId: 's1',
+            timestamp: ts2,
+            message: {
+              id: 'msg-1', type: 'message', role: 'assistant', model: 'claude-sonnet-4-5',
+              content: [{ type: 'text', text: 'done' }],
+              usage: { input_tokens: 500, output_tokens: 50, cache_creation_input_tokens: 0, cache_read_input_tokens: 400 },
+            },
+          }),
+        ].join('\n'),
+      )
+
+      const args = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'all', '--no-optimize']
+      const result = runCli(args, home)
+      expect(result.status, `stderr: ${result.stderr}`).toBe(0)
+      const payload = JSON.parse(result.stdout) as {
+        current: { providerDetails: Array<{ id: string; cacheReadTokens?: number }> }
+      }
+      expect(payload.current.providerDetails.find(provider => provider.id === 'claude')?.cacheReadTokens).toBe(400)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('recomputes a snapshot from the previous render revision, then reuses it stably', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-cache-render-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts1 = base.toISOString().replace(/\.\d+Z$/, 'Z')
+      const ts2 = new Date(base.getTime() + 60_000).toISOString().replace(/\.\d+Z$/, 'Z')
+
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [
+          userLine('s1', ts1),
+          JSON.stringify({
+            type: 'assistant',
+            sessionId: 's1',
+            timestamp: ts2,
+            message: {
+              id: 'msg-1', type: 'message', role: 'assistant', model: 'claude-sonnet-4-5',
+              content: [{ type: 'text', text: 'done' }],
+              usage: { input_tokens: 500, output_tokens: 50, cache_creation_input_tokens: 0, cache_read_input_tokens: 400 },
+            },
+          }),
+        ].join('\n'),
+      )
+
+      const args = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'all', '--no-optimize']
+
+      // First run writes a snapshot under the current (v7) semantic key.
+      const first = runCli(args, home)
+      expect(first.status, `stderr: ${first.stderr}`).toBe(0)
+
+      const snapshotFiles = findSnapshotFiles(join(home, '.cache', 'codeburn'))
+      expect(snapshotFiles).toHaveLength(1)
+      const record = JSON.parse(await readFile(snapshotFiles[0]!, 'utf-8')) as {
+        semanticKey: string
+        payload: { current: { providerDetails: Array<{ id: string; cacheReadTokens?: number }> } }
+      }
+      // Downgrade to the PREVIOUS render revision and strip the cache field,
+      // simulating a warm snapshot from the branch that took it: it must be
+      // rejected rather than served as if it had this data.
+      record.semanticKey = record.semanticKey.replace(/:render-\d+:/, PREVIOUS_RENDER_TAG)
+      for (const row of record.payload.current.providerDetails) delete row.cacheReadTokens
+      await writeFile(snapshotFiles[0]!, JSON.stringify(record))
+
+      // Recompute: the previous-revision record is rejected and rebuilt with
+      // cache data.
+      const second = runCli(args, home)
+      expect(second.status, `stderr: ${second.stderr}`).toBe(0)
+      const rebuilt = JSON.parse(second.stdout) as {
+        current: { providerDetails: Array<{ id: string; cacheReadTokens?: number }> }
+      }
+      expect(rebuilt.current.providerDetails.find(provider => provider.id === 'claude')?.cacheReadTokens).toBe(400)
+
+      // Stable reuse: the recomputed current-revision snapshot is served
+      // as-is. Inject a sentinel into the on-disk payload (keeping the current
+      // key and fingerprint) and confirm the next run returns it rather than
+      // recomputing.
+      const files = findSnapshotFiles(join(home, '.cache', 'codeburn'))
+      const fresh = JSON.parse(await readFile(files[0]!, 'utf-8')) as {
+        semanticKey: string
+        payload: { sentinel?: string }
+      }
+      expect(fresh.semanticKey).toContain(CURRENT_RENDER_TAG)
+      fresh.payload.sentinel = 'reused-current'
+      await writeFile(files[0]!, JSON.stringify(fresh))
+
+      const third = runCli(args, home)
+      expect(third.status, `stderr: ${third.stderr}`).toBe(0)
+      expect(JSON.parse(third.stdout)).toHaveProperty('sentinel', 'reused-current')
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('rejects a pre-count-basis render-5 snapshot on an empty unchanged corpus', async () => {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-legacy-basis-empty-'))
 
@@ -935,7 +1061,7 @@ describe('codeburn status --format menubar-json', () => {
       expect(payload.current.calls).toBe(original.current.calls)
 
       const rewritten = JSON.parse(await readFile(snapshotFiles[0]!, 'utf-8')) as { semanticKey: string }
-      expect(rewritten.semanticKey).toContain(':render-6:')
+      expect(rewritten.semanticKey).toContain(CURRENT_RENDER_TAG)
       expect(rewritten.semanticKey).not.toContain(':render-5:')
 
       const third = runCli(args, home)

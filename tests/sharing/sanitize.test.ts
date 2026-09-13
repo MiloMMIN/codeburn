@@ -23,7 +23,11 @@ function fixture(): MenubarPayload {
         { name: 'secret-project', cost: 100, savingsUSD: 0, sessions: 2, avgCostPerSession: 50, sessionDetails: [] },
       ],
       tools: [{ name: 'Bash', calls: 9 }],
-      topSessions: [{ project: 'secret-project', cost: 100, savingsUSD: 0, calls: 5, date: '2026-06-01' }],
+      topSessions: [{ project: 'secret-project', cost: 100, savingsUSD: 0, calls: 5, date: '2026-06-01', projectKey: '-Users-me-Projects-secret-project' }],
+      byBranch: [
+        { branch: 'exp/extraction-arms', cost: 60, calls: 3, sessions: 1 },
+        { branch: null, cost: 40, calls: 2, sessions: 1 },
+      ],
     },
     history: {
       daily: [],
@@ -60,6 +64,17 @@ describe('sanitizeForSharing', () => {
   it('leaks no project name anywhere in the shared payload', () => {
     const clean = sanitizeForSharing(fixture())
     expect(JSON.stringify(clean)).not.toContain('secret-project')
+  })
+
+  it('drops the per-branch rows: branch names encode tickets, customers and codenames', () => {
+    const clean = sanitizeForSharing(fixture())
+    expect(clean.current.byBranch).toBeUndefined()
+    expect(JSON.stringify(clean)).not.toContain('exp/extraction-arms')
+  })
+
+  it('leaks no working-directory key from the session rows', () => {
+    const clean = sanitizeForSharing(fixture())
+    expect(JSON.stringify(clean)).not.toContain('-Users-me-Projects-secret-project')
   })
 
   it('drops the live-session block, which names the project and branch in flight', () => {

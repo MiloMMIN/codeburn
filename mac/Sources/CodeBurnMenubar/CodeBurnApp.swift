@@ -1334,19 +1334,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
 
         // nil whenever the setting is off or the chosen metric has no data, in
         // which case the title falls back to the single-row composition.
-        let secondRow = MenubarRowFormatter.secondRow(
-            settings: store.menubarRowSettings,
-            snapshot: store.menubarRowSnapshot
-        )
+        // `menubarRowSnapshot` walks every provider's quota summary and reads
+        // the today block, so it is only built once the setting is on: with the
+        // row off a refresh costs no more than the bool it already reads.
+        let rowSettings = store.menubarRowSettings
+        let secondRow = rowSettings.isSecondRowEnabled
+            ? MenubarRowFormatter.secondRow(settings: rowSettings, snapshot: store.menubarRowSnapshot)
+            : nil
         applyTitleLineMode(to: button, multiline: secondRow != nil)
-        button.attributedTitle = composeStatusTitle(
+        let title = composeStatusTitle(
             style: secondRow == nil ? .singleRow : .twoRow,
             secondRow: secondRow
+        )
+        button.attributedTitle = title
+        // The two-line title is one string with a literal newline in it, which
+        // VoiceOver reads as a single run-on phrase. Spell it out instead. The
+        // single-row state sets nil, so turning the row off restores exactly the
+        // label AppKit derives from the title on its own.
+        button.setAccessibilityLabel(
+            secondRow == nil ? nil : MenubarRowFormatter.accessibilityLabel(title: title.string)
         )
 
         let menubarPeriod = store.menubarPeriod
         if let shortfall = store.menubarBadgeDeviceShortfall {
-            button.toolTip = "CodeBurn \(menubarPeriod.menubarMetricLabel) · \(shortfall.reachable) of \(shortfall.total) devices reporting"
+            button.toolTip = L(
+                "CodeBurn %@ · %lld of %lld devices reporting",
+                menubarPeriod.menubarMetricLabel,
+                shortfall.reachable,
+                shortfall.total
+            )
         } else {
             button.toolTip = "CodeBurn \(menubarPeriod.menubarMetricLabel)"
         }
@@ -1427,7 +1443,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
                 valueText = compact ? "\(total)\(suffix)" : " \(total)\(suffix)"
             } else if store.displayMetric == .credits, let p = menubarPayload?.current {
                 let credits = formatTokensMenubar((p.codexCredits ?? 0).rounded())
-                valueText = compact ? "\(credits)cr\(suffix)" : " \(credits) credits\(suffix)"
+                valueText = compact ? "\(credits)cr\(suffix)" : " " + L("%@ credits", credits) + suffix
             } else {
                 let fallback = compact ? "$-" : "$—"
                 valueText = compact
@@ -1624,29 +1640,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         usageItem.isEnabled = false
         menu.addItem(usageItem)
 
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: "")
+        let settingsItem = NSMenuItem(title: L("Settings…"), action: #selector(openSettings), keyEquivalent: "")
         settingsItem.target = self
         settingsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings")
         menu.addItem(settingsItem)
 
-        let dockSettingsItem = NSMenuItem(title: "Capacity Dock Settings…", action: #selector(openCapacityDockSettings), keyEquivalent: "")
+        let dockSettingsItem = NSMenuItem(title: L("Capacity Dock Settings…"), action: #selector(openCapacityDockSettings), keyEquivalent: "")
         dockSettingsItem.target = self
         dockSettingsItem.image = NSImage(systemSymbolName: "rectangle.trailinghalf.inset.filled.arrow.trailing", accessibilityDescription: "Capacity Dock")
         menu.addItem(dockSettingsItem)
 
-        let refreshNow = NSMenuItem(title: "Refresh Now", action: #selector(refreshNowAction), keyEquivalent: "")
+        let refreshNow = NSMenuItem(title: L("Refresh Now"), action: #selector(refreshNowAction), keyEquivalent: "")
         refreshNow.target = self
         menu.addItem(refreshNow)
 
-        let updateItem = NSMenuItem(title: "Check for Updates", action: #selector(checkForUpdates), keyEquivalent: "")
+        let updateItem = NSMenuItem(title: L("Check for Updates"), action: #selector(checkForUpdates), keyEquivalent: "")
         updateItem.target = self
         menu.addItem(updateItem)
 
-        let aboutItem = NSMenuItem(title: "About CodeBurn", action: #selector(openAbout), keyEquivalent: "")
+        let aboutItem = NSMenuItem(title: L("About CodeBurn"), action: #selector(openAbout), keyEquivalent: "")
         aboutItem.target = self
         menu.addItem(aboutItem)
 
-        let quitItem = NSMenuItem(title: "Quit CodeBurn", action: #selector(quitApp), keyEquivalent: "")
+        let quitItem = NSMenuItem(title: L("Quit CodeBurn"), action: #selector(quitApp), keyEquivalent: "")
         quitItem.target = self
         menu.addItem(quitItem)
 
@@ -1687,9 +1703,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
 
     /// One-line "today" summary for the context menu's usage row.
     private func contextMenuUsageSummary() -> String {
-        guard let current = store.todayPayload?.current else { return "Today · no usage yet" }
-        let calls = current.calls == 1 ? "1 call" : "\(current.calls) calls"
-        return "Today · \(current.cost.asCurrency()) · \(calls)"
+        guard let current = store.todayPayload?.current else { return L("Today · no usage yet") }
+        let calls = current.calls == 1 ? L("1 call") : L("%lld calls", current.calls)
+        return L("Today · %@ · %@", current.cost.asCurrency(), calls)
     }
 
     private var settingsWindowController: NSWindowController?
@@ -1725,7 +1741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             backing: .buffered,
             defer: false
         )
-        window.title = "CodeBurn Settings"
+        window.title = L("CodeBurn Settings")
         window.contentViewController = hosting
         window.center()
         window.isReleasedWhenClosed = false
@@ -1764,24 +1780,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             let alert = NSAlert()
             alert.icon = codeburnAlertIcon()
             if let error = updateChecker.updateError {
-                alert.messageText = "Update Check Failed"
+                alert.messageText = L("Update Check Failed")
                 alert.informativeText = error
                 alert.alertStyle = .warning
             } else if updateChecker.updateAvailable, let latest = updateChecker.latestVersion {
-                alert.messageText = "Update Available"
-                let header = "\(AppVersion.display(latest)) is available (you have \(AppVersion.display(updateChecker.currentVersion)))."
+                alert.messageText = L("Update Available")
+                let header = L(
+                    "%@ is available (you have %@).",
+                    AppVersion.display(latest),
+                    AppVersion.display(updateChecker.currentVersion)
+                )
                 if updateChecker.cliTooOldForUpdate {
-                    alert.informativeText = "\(header) Your codeburn CLI is too old to install it. First run:\n\n\(updateChecker.cliUpdateCommand)\n\nthen:\n\ncodeburn menubar --force"
+                    alert.informativeText = L(
+                        "%@ Your codeburn CLI is too old to install it. First run:\n\n%@\n\nthen:\n\ncodeburn menubar --force",
+                        header,
+                        updateChecker.cliUpdateCommand
+                    )
                 } else {
-                    alert.informativeText = "\(header) Run:\n\ncodeburn menubar --force"
+                    alert.informativeText = L("%@ Run:\n\ncodeburn menubar --force", header)
                 }
                 alert.alertStyle = .informational
             } else {
-                alert.messageText = "Up to Date"
-                alert.informativeText = "You're on the latest version (\(AppVersion.display(updateChecker.currentVersion)))."
+                alert.messageText = L("Up to Date")
+                alert.informativeText = L(
+                    "You're on the latest version (%@).",
+                    AppVersion.display(updateChecker.currentVersion)
+                )
                 alert.alertStyle = .informational
             }
-            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: L("OK"))
             alert.runModal()
         }
     }
@@ -1817,6 +1844,10 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
+        // Only the release notice installs anything. Every other poster shares
+        // this delegate, so a tap on one of those must not start an update.
+        guard response.notification.request.identifier
+            .hasPrefix(UpdateChecker.notificationIdentifierPrefix) else { return }
         await MainActor.run { self.updateChecker.performFullUpdate() }
     }
 }

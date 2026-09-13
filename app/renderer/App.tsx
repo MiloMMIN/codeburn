@@ -16,21 +16,40 @@ import { Window } from './components/Window'
 import { clearPolledMemo, hasPolledMemo, polledMemoTimestamp, primePolledMemo, usePolled } from './hooks/usePolled'
 import { readDailyBudget } from './lib/budget'
 import { formatCompact, formatUsd, setActiveCurrency } from './lib/format'
+import {
+  EMPTY_FILTERS,
+  filtersActive,
+  modelFilters,
+  projectFilters,
+  unionFilters,
+  type InvestigationFilters,
+} from './lib/investigation'
+import {
+  backState,
+  EMPTY_NAV_HISTORY,
+  forwardState,
+  persistNavState,
+  pushState,
+  readPersistedNavState,
+  type NavHistory,
+  type NavState,
+} from './lib/navHistory'
 import { motionClass } from './lib/motion'
 import { clearOverviewHeadlines, readOverviewHeadline, writeOverviewHeadline } from './lib/overviewSnapshot'
 import { codeburn } from './lib/ipc'
 import { trackEvent } from './lib/track'
-import { isModifierChord, shortcutLabel } from './lib/platform'
+import { isMacPlatform, isModifierChord, shortcutLabel } from './lib/platform'
 import { localDateKey, PERIOD_LABELS } from './lib/period'
 import { readDisabledProviders } from './lib/providers'
 import { reportMemoKey } from './lib/reportMemoKey'
 import { persistRefreshValue, readRefreshValue, refreshValueToMs, RefreshCadenceContext, type RefreshCadence } from './lib/refreshCadence'
-import { OverviewContent } from './sections/Overview'
+import { OverviewContent, type InvestigateRequest } from './sections/Overview'
 import { OptimizeContent } from './sections/Optimize'
 import { Models } from './sections/Models'
-import { Sessions } from './sections/Sessions'
+import { INITIAL_VISIBLE, Sessions, type SessionSort } from './sections/Sessions'
 import { PullRequestsContent } from './sections/PullRequests'
 import { Compare } from './sections/Compare'
+import { PeriodCompare } from './sections/PeriodCompare'
 import { Plans } from './sections/Plans'
 import { Settings, type SettingsPane } from './sections/Settings'
 import { SpendContent } from './sections/Spend'
@@ -125,6 +144,7 @@ const SECTION_TITLES: Record<Section, string> = {
   optimize: 'Optimize',
   models: 'Models',
   compare: 'Compare',
+  periods: 'Compare periods',
   plans: 'Plans',
   settings: 'Settings',
   plugins: 'Plugins',
@@ -271,17 +291,48 @@ export function App() {
   )
 }
 
+const NAV_SECTIONS = new Set<string>(['overview', 'sessions', 'pullRequests', 'spend', 'optimize', 'models', 'compare', 'plans', 'settings', 'plugins'])
+
+/** Boot position: the best-effort restart snapshot when it is still valid
+ *  (section and period re-validated; a stale drawer revalidates itself once
+ *  the destination data lands), else the plain defaults. */
+function initialNavState(): NavState {
+  const restored = readPersistedNavState()
+  if (restored
+    && NAV_SECTIONS.has(restored.section)
+    && isPeriod(restored.period)) {
+    return { ...restored, range: restored.range ?? null, filters: restored.filters ?? EMPTY_FILTERS }
+  }
+  return {
+    section: 'overview',
+    period: initialPeriod(),
+    provider: 'all',
+    range: null,
+    filters: EMPTY_FILTERS,
+    sessionId: null,
+    sort: 'cost',
+    visibleCount: INITIAL_VISIBLE,
+  }
+}
+
 function AppMain() {
-  const [section, setSection] = useState<Section>('overview')
+  const [nav, setNav] = useState<NavState>(initialNavState)
+  const [history, setHistory] = useState<NavHistory>(EMPTY_NAV_HISTORY)
+  // Mirrors for synchronous reads inside callbacks (commit/back/forward must
+  // reason about the CURRENT state, not the one from the last render).
+  const navRef = useRef(nav)
+  navRef.current = nav
+  const historyRef = useRef(history)
+  historyRef.current = history
+
+  const { section, period, provider, filters, sessionId: openSessionId } = nav
+  const customRange = nav.range
   const [settingsPane, setSettingsPane] = useState<SettingsPane>('general')
-  const [period, setPeriod] = useState<Period>(initialPeriod)
-  const [provider, setProvider] = useState<string>('all')
   const [providerCatalog, setProviderCatalog] = useState<{
     key: string | null
     entries: Array<{ id: string; label: string }>
   }>({ key: null, entries: [] })
   const detectedProviders = providerCatalog.entries
-  const [customRange, setCustomRange] = useState<DateRange | null>(null)
   const [claudeConfigSource, setClaudeConfigSource] = useState<string | null>(initialConfigSource)
   const [requestedScope, setScopeState] = useState<Scope>(initialScope)
   const [refreshToken, setRefreshToken] = useState(0)
@@ -293,6 +344,56 @@ function AppMain() {
   const [, setCurrencyTick] = useState(0)
   const [snapshotRevision, setSnapshotRevision] = useState(0)
   const configGenerationRef = useRef(0)
+
+  /** Commit a new app position: one history entry per committed change, with
+   *  identical consecutive states coalesced (poll refreshes never push). */
+  const commitNav = useCallback((patch: Partial<NavState>) => {
+    const current = navRef.current
+    const next = { ...current, ...patch }
+    if (next === current) return
+    navRef.current = next
+    setNav(next)
+    setHistory(currentHistory => pushState(currentHistory, current, next))
+  }, [])
+
+  const goBack = useCallback(() => {
+    const result = backState(historyRef.current, navRef.current)
+    if (!result) return
+    historyRef.current = result.history
+    setHistory(result.history)
+    navRef.current = result.state
+    setNav(result.state)
+  }, [])
+
+  const goForward = useCallback(() => {
+    const result = forwardState(historyRef.current, navRef.current)
+    if (!result) return
+    historyRef.current = result.history
+    setHistory(result.history)
+    navRef.current = result.state
+    setNav(result.state)
+  }, [])
+
+  // Best-effort restart restore of the app position (section, selection,
+  // drawer): the snapshot revalidates lazily — the Sessions drawer closes
+  // itself when its session is no longer in the reloaded population.
+  useEffect(() => { persistNavState(nav) }, [nav])
+
+  /** A drill-through entry from any report: navigate to Sessions with the
+   *  selection applied (and the drawer pre-opened for a session entry). While
+   *  an investigation is already active, a second aggregate click UNIONS into
+   *  it (the OR rule within a dimension; the drawer closes for revalidation). */
+  const investigate = useCallback((request: InvestigateRequest) => {
+    const current = navRef.current
+    // An active investigation survives going Back to the graph (that is the
+    // point of returning with context), so a further aggregate click unions
+    // into it instead of discarding it. With no active selection the click
+    // starts a fresh one.
+    const filters = filtersActive(current.filters)
+      ? unionFilters(current.filters, request.filters)
+      : request.filters
+    commitNav({ section: 'sessions', filters, sessionId: request.sessionId ?? null, visibleCount: INITIAL_VISIBLE })
+  }, [commitNav])
 
   // Preserve the 2/3-arg call shapes when no config is scoped so the CLI argv
   // stays flag-free; only add --claude-config-source once a config is picked.
@@ -357,7 +458,7 @@ function AppMain() {
     const sessions = overview.data?.current.sessions
     if (!autoPeriod.current || sessions === undefined) return
     autoPeriod.current = false
-    if (period === 'today' && sessions === 0) setPeriod('week')
+    if (period === 'today' && sessions === 0) commitNav({ period: 'week', visibleCount: INITIAL_VISIBLE })
   }, [overview.data, period])
 
   const overviewCold = isColdHydrating(overview.error)
@@ -627,12 +728,51 @@ function AppMain() {
 
   const navigate = useCallback((next: Section, pane: SettingsPane = 'general') => {
     setSettingsPane(pane)
-    setSection(next)
+    commitNav({ section: next })
     trackEvent('section_view', { section: next })
-  }, [])
+  }, [commitNav])
+
+  /** Compare periods' contribution drill-down: the same Sessions destination
+   *  every other drill-through lands on, scoped to the clicked side's range
+   *  and filtered to the contribution's own key. Not a union: the range moves,
+   *  so any previous selection no longer describes this population. */
+  const inspectContribution = useCallback((range: DateRange, dimension: 'project' | 'model', key: string) => {
+    commitNav({
+      section: 'sessions',
+      range,
+      filters: dimension === 'project' ? projectFilters(key) : modelFilters([key]),
+      sessionId: null,
+      visibleCount: INITIAL_VISIBLE,
+    })
+  }, [commitNav])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      // Back/Forward in app history: the platform navigation chords (Cmd+[ /
+      // Cmd+] on macOS, Alt+Left/Right elsewhere). Checked BEFORE
+      // isModifierChord, which deliberately rejects Alt for layout reasons.
+      const mac = isMacPlatform()
+      const plainModifiers = !event.ctrlKey && !event.metaKey && !event.shiftKey
+      if (mac && event.metaKey && !event.ctrlKey && !event.altKey && event.key === '[') {
+        event.preventDefault()
+        goBack()
+        return
+      }
+      if (mac && event.metaKey && !event.ctrlKey && !event.altKey && event.key === ']') {
+        event.preventDefault()
+        goForward()
+        return
+      }
+      if (!mac && plainModifiers && event.altKey && event.key === 'ArrowLeft') {
+        event.preventDefault()
+        goBack()
+        return
+      }
+      if (!mac && plainModifiers && event.altKey && event.key === 'ArrowRight') {
+        event.preventDefault()
+        goForward()
+        return
+      }
       if (!isModifierChord(event)) return
       const key = event.key.toLowerCase()
       if (key === '1') navigate('overview')
@@ -642,6 +782,7 @@ function AppMain() {
       else if (key === '5') navigate('optimize')
       else if (key === '6') navigate('models')
       else if (key === '7') navigate('compare')
+      else if (key === '9') navigate('periods')
       else if (key === '8') navigate('plans')
       else if (key === ',') navigate('settings')
       else if (key === 'r') refreshVisible()
@@ -651,13 +792,12 @@ function AppMain() {
 
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
-  }, [refreshVisible, navigate])
+  }, [refreshVisible, navigate, goBack, goForward])
 
   const onPeriodChange = (value: string) => {
     if (isPeriod(value)) {
       autoPeriod.current = false
-      setCustomRange(null)
-      setPeriod(value)
+      commitNav({ period: value, range: null, visibleCount: INITIAL_VISIBLE })
     }
   }
 
@@ -667,7 +807,7 @@ function AppMain() {
   // implies a device-specific view, so drop combined scope back to local.
   const onConfigSelect = (id: string) => {
     const next = id || null
-    if (next && provider !== 'all' && provider !== 'claude') setProvider('all')
+    if (next && provider !== 'all' && provider !== 'claude') commitNav({ provider: 'all' })
     if (next && scope === 'combined') { setScopeState('local'); persistScope('local') }
     setClaudeConfigSource(next)
     persistConfigSource(next)
@@ -683,7 +823,7 @@ function AppMain() {
       setClaudeConfigSource(null)
       persistConfigSource(null)
     }
-    setProvider(value)
+    commitNav({ provider: value })
   }
 
   // Re-read on config invalidation (another window can save the pane too), on a
@@ -722,7 +862,7 @@ function AppMain() {
   const onScopeChange = (value: string) => {
     const next: Scope = value === 'combined' ? 'combined' : 'local'
     if (next === 'combined') {
-      if (provider !== 'all') setProvider('all')
+      if (provider !== 'all') commitNav({ provider: 'all' })
       if (claudeConfigSource) { setClaudeConfigSource(null); persistConfigSource(null) }
     }
     setScopeState(next)
@@ -772,11 +912,15 @@ function AppMain() {
           <>
             <TopBar
               title={SECTION_TITLES[section]}
+              canBack={history.past.length > 0}
+              canForward={history.future.length > 0}
+              onBack={goBack}
+              onForward={goForward}
               scope={scopeCaption}
               period={period}
               onPeriodChange={onPeriodChange}
               customRange={customRange}
-              onRangeSelect={setCustomRange}
+              onRangeSelect={range => commitNav({ range, visibleCount: INITIAL_VISIBLE })}
               provider={provider}
               providerLabel={providerLabel}
               providerOptions={providerOptions}
@@ -787,19 +931,25 @@ function AppMain() {
             />
             <div className={motionClass('body', 'section-fade')}>
               {section === 'overview' ? (
-                <OverviewContent period={period} provider={provider} range={customRange} overview={overview} onNavigate={navigate} ready={ready} scope={scope} headlineSnapshot={headlineSnapshot} />
+                <OverviewContent period={period} provider={provider} range={customRange} overview={overview} onNavigate={navigate} onInvestigate={investigate} ready={ready} scope={scope} headlineSnapshot={headlineSnapshot} />
               ) : section === 'sessions' ? (
-                <Sessions period={period} provider={provider} range={customRange} refreshToken={refreshToken} detectedProviders={visibleProviderEntries} onProviderChange={onProviderSelect} ready={ready} />
+                // A new sort or a changed selection reorders the whole list, so
+                // the pagination depth resets IN THE SAME commit — one history
+                // entry, and the depth a Back/Forward restores stays whatever it
+                // was when that position was committed.
+                <Sessions period={period} provider={provider} range={customRange} refreshToken={refreshToken} detectedProviders={visibleProviderEntries} onProviderChange={onProviderSelect} ready={ready} filters={filters} onFiltersChange={next => commitNav({ filters: next, visibleCount: INITIAL_VISIBLE })} openSessionId={openSessionId} onSessionOpen={key => commitNav({ sessionId: key })} onSessionClose={() => commitNav({ sessionId: null })} sort={nav.sort as SessionSort} onSortChange={value => commitNav({ sort: value, visibleCount: INITIAL_VISIBLE })} visibleCount={nav.visibleCount} onVisibleCountChange={value => commitNav({ visibleCount: value })} />
               ) : section === 'pullRequests' ? (
-                <PullRequestsContent overview={overview} period={period} provider={provider} range={customRange} />
+                <PullRequestsContent overview={overview} period={period} provider={provider} range={customRange} onInvestigate={investigate} />
               ) : section === 'spend' ? (
-                <SpendContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} ready={ready} />
+                <SpendContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} ready={ready} onInvestigate={investigate} />
               ) : section === 'optimize' ? (
                 <OptimizeContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} ready={ready} />
               ) : section === 'models' ? (
-                <Models period={period} provider={provider} range={customRange} refreshToken={refreshToken} onNavigate={navigate} ready={ready} />
+                <Models period={period} provider={provider} range={customRange} refreshToken={refreshToken} onNavigate={navigate} onInvestigate={investigate} ready={ready} />
               ) : section === 'compare' ? (
-                <Compare period={period} provider={provider} range={customRange} refreshToken={refreshToken} ready={ready} />
+                <Compare period={period} provider={provider} range={customRange} refreshToken={refreshToken} ready={ready} onInvestigate={investigate} />
+              ) : section === 'periods' ? (
+                <PeriodCompare provider={provider} refreshToken={refreshToken} ready={ready} onInspectContribution={inspectContribution} />
               ) : (
                 <SectionPlaceholder title={SECTION_TITLES[section]} />
               )}
@@ -810,7 +960,7 @@ function AppMain() {
         {section !== 'settings' && (
           <Hint
             items={[
-              { k: shortcutLabel('1-8'), label: 'Navigate' },
+              { k: shortcutLabel('1-8,9'), label: 'Navigate' },
               { k: shortcutLabel(','), label: 'Settings' },
               { k: shortcutLabel('R'), label: 'Refresh' },
             ]}

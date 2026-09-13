@@ -245,6 +245,224 @@ struct MenubarSecondRowTests {
         #expect(MenubarQuotaRowSelection.primary(from: candidates.reversed())?.label == "Claude")
     }
 
+    // MARK: - Which window a provider contributes
+
+    private func summary(
+        _ filter: ProviderFilter,
+        connection: QuotaSummary.Connection = .connected,
+        primary: QuotaSummary.Window? = nil,
+        details: [QuotaSummary.Window]
+    ) -> QuotaSummary {
+        QuotaSummary(
+            providerFilter: filter,
+            connection: connection,
+            primary: primary,
+            details: details,
+            planLabel: nil,
+            footerLines: []
+        )
+    }
+
+    @Test("the row reports each provider's worst window, not its billing headline")
+    func candidateUsesWorstWindow() {
+        // The shape reported from a real machine in #1310: Cursor's API window is
+        // exhausted and Claude's 5-hour window is the busier of its two, while the
+        // headline rule answers Monthly 9.5% and Weekly 5% and so reports a
+        // machine that is nowhere near a limit.
+        let cursor = summary(.cursor, details: [
+            QuotaSummary.Window(label: "API", percent: 1.0, resetsAt: nil),
+            QuotaSummary.Window(label: "Monthly", percent: 0.095, resetsAt: nil),
+        ])
+        let weekly = QuotaSummary.Window(label: "Weekly", percent: 0.05, resetsAt: nil)
+        let claude = summary(.claude, primary: weekly, details: [
+            QuotaSummary.Window(label: "Current session (5h)", percent: 0.18, resetsAt: nil),
+            weekly,
+        ])
+        // What the headline rule answers, and what the row must no longer use.
+        #expect(cursor.headlineWindow?.percent == 0.095)
+        #expect(claude.headlineWindow?.percent == 0.05)
+
+        let cursorCandidate = MenubarQuotaRowSelection.candidate(label: "Cursor", summary: cursor)
+        let claudeCandidate = MenubarQuotaRowSelection.candidate(label: "Claude", summary: claude)
+        #expect(cursorCandidate?.percentUsed == 1.0)
+        #expect(claudeCandidate?.percentUsed == 0.18)
+
+        let chosen = MenubarQuotaRowSelection.primary(
+            from: [claudeCandidate, cursorCandidate].compactMap { $0 }
+        )
+        #expect(chosen?.label == "Cursor")
+        #expect(
+            MenubarRowFormatter.secondRow(
+                settings: settings(true, .quotaRemaining),
+                snapshot: snapshot(quota: chosen),
+                now: now
+            ) == "Cursor 0% left"
+        )
+    }
+
+    @Test("a per-model window counts, the same way the flame counts it")
+    func candidateCountsPerModelWindows() {
+        let claude = summary(.claude, details: [
+            QuotaSummary.Window(label: "Weekly", percent: 0.05, resetsAt: nil),
+            QuotaSummary.Window(label: "Weekly · Opus", percent: 0.87, resetsAt: nil),
+        ])
+        #expect(MenubarQuotaRowSelection.candidate(label: "Claude", summary: claude)?.percentUsed == 0.87)
+        #expect(MenubarQuotaRowSelection.worstWindow(claude)?.label == "Weekly · Opus")
+    }
+
+    @Test("the worst window carries its own reset instant")
+    func candidateKeepsWorstWindowReset() {
+        let reset = now.addingTimeInterval(5 * 3600)
+        let codex = summary(.codex, details: [
+            QuotaSummary.Window(label: "Weekly", percent: 0.2, resetsAt: now.addingTimeInterval(86_400)),
+            QuotaSummary.Window(label: "5h", percent: 0.94, resetsAt: reset),
+        ])
+        let candidate = MenubarQuotaRowSelection.candidate(label: "Codex", summary: codex)
+        #expect(candidate?.resetsAt == reset)
+        #expect(
+            MenubarRowFormatter.secondRow(
+                settings: settings(true, .quotaRemaining),
+                snapshot: snapshot(quota: candidate),
+                now: now
+            ) == "Codex 6% left · 5h 0m"
+        )
+    }
+
+    @Test("equally used windows break on label so the countdown does not swap")
+    func worstWindowTieBreak() {
+        let a = QuotaSummary.Window(label: "Alpha", percent: 0.5, resetsAt: nil)
+        let b = QuotaSummary.Window(label: "Beta", percent: 0.5, resetsAt: nil)
+        #expect(MenubarQuotaRowSelection.worstWindow(summary(.claude, details: [a, b]))?.label == "Alpha")
+        #expect(MenubarQuotaRowSelection.worstWindow(summary(.claude, details: [b, a]))?.label == "Alpha")
+    }
+
+    @Test("a provider with no usable window contributes nothing")
+    func candidateWithoutWindows() {
+        #expect(MenubarQuotaRowSelection.candidate(label: "Claude", summary: summary(.claude, details: [])) == nil)
+        let broken = summary(.claude, details: [QuotaSummary.Window(label: "Weekly", percent: .nan, resetsAt: nil)])
+        #expect(MenubarQuotaRowSelection.candidate(label: "Claude", summary: broken) == nil)
+    }
+
+    @Test("a provider backing off keeps its last-known window, as the dock does")
+    func transientFailureStaysACandidate() {
+        let windows = [QuotaSummary.Window(label: "5h", percent: 0.62, resetsAt: nil)]
+        let feeding: [QuotaSummary.Connection] = [.connected, .stale, .transientFailure]
+        for connection in feeding {
+            #expect(MenubarQuotaRowSelection.feedsRow(connection))
+            let quota = summary(.claude, connection: connection, details: windows)
+            #expect(MenubarQuotaRowSelection.candidate(label: "Claude", summary: quota)?.percentUsed == 0.62)
+        }
+        let silent: [QuotaSummary.Connection] = [.disconnected, .loading, .terminalFailure(reason: "expired")]
+        for connection in silent {
+            #expect(!MenubarQuotaRowSelection.feedsRow(connection))
+            let quota = summary(.claude, connection: connection, details: windows)
+            #expect(MenubarQuotaRowSelection.candidate(label: "Claude", summary: quota) == nil)
+        }
+    }
+
+    // MARK: - Width cap
+
+    @Test("a long provider name is shortened instead of widening the status item")
+    func secondRowIsCapped() {
+        let row = MenubarRowFormatter.secondRow(
+            settings: settings(true, .quotaRemaining),
+            snapshot: snapshot(
+                quota: MenubarQuotaCandidate(
+                    label: "GitHub Copilot",
+                    percentUsed: 0.88,
+                    resetsAt: now.addingTimeInterval(6 * 86_400 + 3 * 3600)
+                )
+            ),
+            now: now
+        )
+        // Both figures survive; the name is what gives way.
+        #expect(row == "GitHub… 12% left · 6d 3h")
+        #expect(MenubarRowFormatter.displayCells(row ?? "") == MenubarRowFormatter.secondRowCharacterBudget)
+    }
+
+    @Test("no metric can produce a row past the budget")
+    func everyMetricRespectsTheBudget() {
+        let wide = snapshot(
+            quota: MenubarQuotaCandidate(
+                label: "Some Very Long Provider Name",
+                percentUsed: 0.015,
+                resetsAt: now.addingTimeInterval(3 * 86_400 + 14 * 3600)
+            ),
+            todayCost: 123_456.78,
+            todayTotalTokens: 987_654_321,
+            activeSessionCount: 4096,
+            currencySymbol: "CHF",
+            currencyRate: 1
+        )
+        for metric in MenubarSecondRowMetric.allCases {
+            let row = MenubarRowFormatter.secondRow(settings: settings(true, metric), snapshot: wide, now: now)
+            #expect(row != nil)
+            #expect(MenubarRowFormatter.displayCells(row ?? "") <= MenubarRowFormatter.secondRowCharacterBudget)
+        }
+    }
+
+    @Test("rows inside the budget are left exactly as they were")
+    func shortRowsAreUntouched() {
+        #expect(MenubarRowFormatter.abbreviate("Claude", to: 24) == "Claude")
+        #expect(MenubarRowFormatter.abbreviate("Claude", to: 6) == "Claude")
+        #expect(MenubarRowFormatter.abbreviate("Claude", to: 5) == "Clau…")
+        // A cut that lands on a space drops it rather than leaving "GitHub …".
+        #expect(MenubarRowFormatter.abbreviate("GitHub Copilot", to: 8) == "GitHub…")
+        // No room for anything meaningful: the caller drops the part instead.
+        #expect(MenubarRowFormatter.abbreviate("Claude", to: 1) == "")
+        #expect(MenubarRowFormatter.abbreviate("Claude", to: 0) == "")
+        #expect(MenubarRowFormatter.abbreviate("Claude", to: -3) == "")
+        #expect(MenubarRowFormatter.clampToRowBudget("12 sess") == "12 sess")
+    }
+
+    @Test("a wide-glyph row is budgeted by the width it draws, not its character count")
+    func wideGlyphsCountDouble() {
+        // "6 小时 2 分" is 8 Characters and 11 cells. Counting Characters let a
+        // zh-Hans row draw about a third wider than the budget allows.
+        #expect(MenubarRowFormatter.displayCells("6 小时 2 分") == 11)
+        #expect(MenubarRowFormatter.displayCells("GitHub Copilot") == 14)
+        // An all-Latin row is unchanged: cells and characters agree.
+        #expect(MenubarRowFormatter.abbreviate("GitHub Copilot", to: 8) == "GitHub…")
+        // Two wide glyphs already fill four cells, so a five-cell limit keeps
+        // one of them plus the mark.
+        #expect(MenubarRowFormatter.abbreviate("剩余配额跟踪", to: 5) == "剩余…")
+        #expect(
+            MenubarRowFormatter.displayCells(
+                MenubarRowFormatter.clampToRowBudget("GitHub Copilot 剩余 12% · 6 小时 2 分")
+            ) <= MenubarRowFormatter.secondRowCharacterBudget
+        )
+    }
+
+    @Test("an unlabelled provider keeps the full figures")
+    func unlabelledQuotaRow() {
+        #expect(
+            MenubarRowFormatter.secondRow(
+                settings: settings(true, .quotaRemaining),
+                snapshot: snapshot(quota: MenubarQuotaCandidate(label: "", percentUsed: 0.5, resetsAt: nil)),
+                now: now
+            ) == "50% left"
+        )
+    }
+
+    // MARK: - Accessibility
+
+    @Test("the two-line title reads as one phrase, without the raw newline")
+    func accessibilityLabelForTwoRows() {
+        // The composed title as the status item holds it: the flame attachment's
+        // placeholder character, the badge, a newline, then the second row.
+        let title = "\u{FFFC} $12.34\nClaude 42% left · 3h 12m"
+        let label = MenubarRowFormatter.accessibilityLabel(title: title)
+        #expect(label == "CodeBurn, $12.34, Claude 42% left, 3h 12m")
+        #expect(!label.contains("\n"))
+        #expect(!label.contains("·"))
+        #expect(!label.contains("\u{FFFC}"))
+    }
+
+    @Test("an icon-only badge still names the second row")
+    func accessibilityLabelIconOnly() {
+        #expect(MenubarRowFormatter.accessibilityLabel(title: "\u{FFFC}\n12 sess") == "CodeBurn, 12 sess")
+    }
+
     // MARK: - Preferences
 
     @Test("settings default to off and round-trip through UserDefaults")

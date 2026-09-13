@@ -42,10 +42,16 @@ const CHANNELS = [
   'codeburn:getActReport',
   'codeburn:getModels',
   'codeburn:getSessions',
+  'codeburn:getSessionsContributions',
   'codeburn:getCompareModels',
   'codeburn:getCompare',
+  'codeburn:getPeriodCompare',
+  'codeburn:getPeriodCompareSessions',
+  'codeburn:getCompareCohortModels',
+  'codeburn:getCompareCohort',
   'codeburn:getYield',
   'codeburn:getSpendFlow',
+  'codeburn:getBranchSpend',
   'codeburn:getOptimizeReport',
   'codeburn:getDevices',
   'codeburn:getDevicesScan',
@@ -100,8 +106,19 @@ const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = 
   { channel: 'codeburn:getModels', args: ['week', 'all', false], argv: ['models', '--format', 'json', '--period', 'week'] },
   { channel: 'codeburn:getSessions', args: ['week', 'all'], argv: ['sessions', '--format', 'json', '--period', 'week'] },
   { channel: 'codeburn:getSessions', args: ['30days', 'claude', { from: '2026-07-01', to: '2026-07-11' }], argv: ['sessions', '--format', 'json', '--period', '30days', '--provider', 'claude', '--from', '2026-07-01', '--to', '2026-07-11'] },
+  { channel: 'codeburn:getSessionsContributions', args: ['week', 'all'], argv: ['sessions', '--format', 'json', '--contributions', '--period', 'week'] },
+  { channel: 'codeburn:getSessionsContributions', args: ['30days', 'claude', { from: '2026-07-01', to: '2026-07-11' }], argv: ['sessions', '--format', 'json', '--contributions', '--period', '30days', '--provider', 'claude', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getCompareModels', args: ['month', 'codex'], argv: ['compare', '--format', 'json', '--period', 'month', '--provider', 'codex'] },
   { channel: 'codeburn:getCompare', args: ['month', 'all', 'model-a', 'model-b'], argv: ['compare', '--format', 'json', '--period', 'month', '--model-a', 'model-a', '--model-b', 'model-b'] },
+  { channel: 'codeburn:getPeriodCompare', args: [{ from: '2026-07-01', to: '2026-07-07' }, { from: '2026-07-08', to: '2026-07-14' }, 'claude'], argv: ['compare-periods', '--format', 'json', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14', '--provider', 'claude'] },
+  { channel: 'codeburn:getPeriodCompare', args: [{ from: '2026-07-01', to: '2026-07-07' }, { from: '2026-07-08', to: '2026-07-14' }, 'all'], argv: ['compare-periods', '--format', 'json', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14'] },
+  { channel: 'codeburn:getPeriodCompareSessions', args: [{ from: '2026-07-01', to: '2026-07-07' }, { from: '2026-07-08', to: '2026-07-14' }, 'all', 'project', '/work/app'], argv: ['compare-periods', '--format', 'sessions', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14', '--dimension', 'project', '--key', '/work/app'] },
+  // Claude sanitizes project paths to dash-leading slugs; the key rides in the
+  // VALUE position of --key, so a dash-leading key must survive validation.
+  { channel: 'codeburn:getPeriodCompareSessions', args: [{ from: '2026-07-01', to: '2026-07-07' }, { from: '2026-07-08', to: '2026-07-14' }, 'all', 'project', '-work-pricing'], argv: ['compare-periods', '--format', 'sessions', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14', '--dimension', 'project', '--key', '-work-pricing'] },
+  { channel: 'codeburn:getCompareCohortModels', args: ['month', 'claude', { from: '2026-07-01', to: '2026-07-11' }], argv: ['compare', '--format', 'cohort-json', '--period', 'month', '--provider', 'claude', '--from', '2026-07-01', '--to', '2026-07-11'] },
+  { channel: 'codeburn:getCompareCohort', args: ['month', 'all', 'model-a', 'model-b'], argv: ['compare', '--format', 'cohort-json', '--period', 'month', '--model-a', 'model-a', '--model-b', 'model-b'] },
+  { channel: 'codeburn:getCompareCohort', args: ['month', 'all', 'model-a', 'model-b', undefined, ['/Users/gone/alpha', '-Users-gone-alpha'], 'coding'], argv: ['compare', '--format', 'cohort-json', '--period', 'month', '--model-a', 'model-a', '--model-b', 'model-b', '--project-id=/Users/gone/alpha', '--project-id=-Users-gone-alpha', '--category', 'coding'] },
   { channel: 'codeburn:getYield', args: ['today', 'all'], argv: ['yield', '--format', 'json', '--period', 'today'] },
   { channel: 'codeburn:getYield', args: ['today', 'claude'], argv: ['yield', '--format', 'json', '--period', 'today', '--provider', 'claude'] },
   { channel: 'codeburn:getSpendFlow', args: ['month', 'openai'], argv: ['spend', '--format', 'flow-json', '--period', 'month', '--provider', 'openai'] },
@@ -118,6 +135,8 @@ const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = 
   { channel: 'codeburn:getModels', args: ['week', 'claude', true, { from: '2026-07-01', to: '2026-07-11' }], argv: ['models', '--format', 'json', '--period', 'week', '--provider', 'claude', '--by-task', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getYield', args: ['today', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['yield', '--format', 'json', '--period', 'today', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getSpendFlow', args: ['month', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['spend', '--format', 'flow-json', '--period', 'month', '--from', '2026-07-01', '--to', '2026-07-11'] },
+  { channel: 'codeburn:getBranchSpend', args: ['month', 'openai'], argv: ['spend', '--format', 'branch-json', '--period', 'month', '--provider', 'openai'] },
+  { channel: 'codeburn:getBranchSpend', args: ['30days', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['spend', '--format', 'branch-json', '--period', '30days', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getOptimizeReport', args: ['month', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['optimize', '--format', 'json', '--period', 'month', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getDevices', args: ['week'], argv: ['devices', '--format', 'json', '--period', 'week'] },
   { channel: 'codeburn:getDevicesScan', args: [], argv: ['devices', 'scan', '--format', 'json'] },
@@ -247,6 +266,10 @@ describe('createBridgeHandlers (IPC input validation)', () => {
     { name: 'device name that looks like a flag', channel: 'codeburn:removeDevice', args: ['-rf'] },
     { name: 'relative export path', channel: 'codeburn:exportData', args: ['json', 'all', 'relative/out'] },
     { name: 'compare model that looks like a flag', channel: 'codeburn:getCompare', args: ['month', 'all', '-a', 'model-b'] },
+    { name: 'cohort model that looks like a flag', channel: 'codeburn:getCompareCohort', args: ['month', 'all', '-a', 'model-b'] },
+    { name: 'cohort project identity containing NUL', channel: 'codeburn:getCompareCohort', args: ['month', 'all', 'model-a', 'model-b', undefined, ['bad\0id']] },
+    { name: 'empty cohort project identity', channel: 'codeburn:getCompareCohort', args: ['month', 'all', 'model-a', 'model-b', undefined, ['']] },
+    { name: 'unknown cohort category', channel: 'codeburn:getCompareCohort', args: ['month', 'all', 'model-a', 'model-b', undefined, undefined, 'not-a-category'] },
     { name: 'price override model that looks like a flag', channel: 'codeburn:setPriceOverride', args: ['-x', { input: 1, output: 2 }] },
     { name: 'non-positive price override rate', channel: 'codeburn:setPriceOverride', args: ['my-model', { input: 0, output: 2 }] },
     { name: 'non-finite price override rate', channel: 'codeburn:setPriceOverride', args: ['my-model', { input: 1, output: Number.POSITIVE_INFINITY }] },
@@ -517,6 +540,7 @@ describe('createBridgeHandlers (cold-start warmup)', () => {
       ['codeburn:getCompareModels', ['today', 'all', true]],
       ['codeburn:getYield', ['today', 'all', undefined, true]],
       ['codeburn:getSpendFlow', ['today', 'all', undefined, true]],
+      ['codeburn:getBranchSpend', ['today', 'all', undefined, true]],
       ['codeburn:getOptimizeReport', ['today', 'all', undefined, true]],
     ]
 
@@ -824,6 +848,26 @@ describe('project filter', () => {
       const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
       await handlers['codeburn:getSessions']!('week', 'all')
       expect(calls[0]).toEqual(['sessions', '--format', 'json', '--period', 'week', '--project=my-company', '--exclude=scratch'])
+      await handlers['codeburn:getSessionsContributions']!('week', 'all')
+      expect(calls[1]).toEqual(['sessions', '--format', 'json', '--contributions', '--period', 'week', '--project=my-company', '--exclude=scratch'])
+      await handlers['codeburn:getBranchSpend']!('week', 'all')
+      expect(calls[2]).toEqual(['spend', '--format', 'branch-json', '--period', 'week', '--project=my-company', '--exclude=scratch'])
+      const rangeA = { from: '2026-07-01', to: '2026-07-07' }
+      const rangeB = { from: '2026-07-08', to: '2026-07-14' }
+      await handlers['codeburn:getPeriodCompare']!(rangeA, rangeB, 'all')
+      expect(calls[3]).toEqual(['compare-periods', '--format', 'json', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14', '--project=my-company', '--exclude=scratch'])
+      // The drill-down too: a filtered-out project must not surface behind a
+      // contribution row either.
+      await handlers['codeburn:getPeriodCompareSessions']!(rangeA, rangeB, 'all', 'model', 'sonnet')
+      expect(calls[4]).toEqual(['compare-periods', '--format', 'sessions', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14', '--project=my-company', '--exclude=scratch', '--dimension', 'model', '--key', 'sonnet'])
+      await handlers['codeburn:getCompareCohortModels']!('week', 'all')
+      expect(calls[5]).toEqual(['compare', '--format', 'cohort-json', '--period', 'week', '--project=my-company', '--exclude=scratch'])
+      // --project-id narrows WITHIN the saved filter; it never replaces it.
+      await handlers['codeburn:getCompareCohort']!('week', 'all', 'model-a', 'model-b', undefined, ['/Users/gone/alpha'])
+      expect(calls[6]).toEqual([
+        'compare', '--format', 'cohort-json', '--period', 'week', '--project=my-company', '--exclude=scratch',
+        '--model-a', 'model-a', '--model-b', 'model-b', '--project-id=/Users/gone/alpha',
+      ])
     })
   })
 

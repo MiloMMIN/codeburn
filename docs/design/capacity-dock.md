@@ -112,6 +112,31 @@ V1 does not include:
   countdown. The most constrained available window supplies the ring value;
   this matches the reference's glance-first use and avoids understating a
   provider whose secondary window is closer to exhaustion.
+- Under that, one line says whether the window lasts: `Lasts until reset` or
+  `Runs out in 2d 8h`, and on windows of six hours or less, where a linear
+  run-out ETA is not defensible off a single burst, the pace stage instead
+  (`On pace`, `40% in deficit`, `30% in reserve`). It is the same whole-window
+  projection the Plan tab's caption uses, computed against the window length
+  the adapter reports — never a length inferred from the display label, which
+  mislabels any provider that picks its label from the distance to the reset.
+  It is silent early in a window, on an exhausted window, without a reset time,
+  without a validated duration, and on data that is stale, disconnected or
+  older than the ten-minute freshness horizon. The dock reserves its height
+  whether or not a column has a caption, because the panel's frame is computed
+  rather than fitted; the agent-tab quota hover card draws the same line under
+  its bar, indented past the label column, and simply omits it when silent
+  because that card is fitted.
+- When a vendor resets one of the provider's windows before its scheduled time,
+  a band under the header says so (`Weekly limit reset 18h early`) for twelve
+  hours after the reset was seen. It is a notice like the staleness line, with
+  the same inset, padding, divider and reserved height, and it can sit alongside
+  it. Detection rides the existing refresh lifecycle and adds no polling: two
+  signals, a reset time that jumps to a new cycle while the stored one still had
+  time to run, and usage emptying while the reset time stands still, coalesced so
+  one goodwill reset is one notice and one notification. It stays silent on a
+  normal scheduled reset, a plan change, clock or timestamp skew, a window that
+  appears or disappears between fetches, a window's first observation, and a
+  provider reconnecting after a terminal failure or a fresh bootstrap.
 - Stale or retrying data remains visible and is labeled/dimmed. A terminal
   authentication/configuration failure provides a Connect/Reconnect action in
   the bubble itself. Network, rate-limit, parse, and provider outages remain
@@ -193,6 +218,10 @@ Add a `Capacity Dock` section to General Settings:
 - `Resting provider` menu, limited to selected providers.
 - `Size` slider from 70% to 120%, defaulting to 85%.
 - `Appearance` menu with `Graphite` and `Liquid Glass`.
+- Early-reset notifications are a switch in the General Settings
+  `Notifications` section, default on, stored under
+  `codeburn.quota.earlyResetNotificationsEnabled`. With it off the dock band
+  still appears; only the system notification is withheld.
 - A compact switch list containing only connected or usable stale providers.
   Provider connection and credential entry remains in the Providers section;
   General Settings never presents the entire 69-provider catalog as dock
@@ -220,6 +249,10 @@ any source-owned consent prompt is reserved for an explicit Connect action.
 - `CapacityDockProviderQuotaService`: dispatch into native CodeBurn provider
   adapters without copying passive credentials.
 - `CapacityDockMotion`: pure timing/easing plus edge-aware interpolation policy.
+- `EarlyQuotaReset`: pure early-reset detection, the bounded notice window, and
+  the local history summariser behind the hover card's caption.
+- `EarlyQuotaResetMonitor`: per-provider baseline, announcement record and
+  delivery through the existing `UpdateNotifier`.
 - `AppDelegate`: create/start/stop the controller and include quota/preferences
   in the existing observation re-arm. It must not own dock rendering details.
 

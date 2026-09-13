@@ -5,6 +5,21 @@ private let cacheTTLSeconds: TimeInterval = 30
 private let interactiveRefreshResetSeconds: TimeInterval = 120
 private let menubarPeriodDefaultsKey = "CodeBurnMenubarPeriod"
 
+private func quotaFetchWasCancelled(_ error: Error) -> Bool {
+    if error is CancellationError { return true }
+    if let error = error as? ClaudeSubscriptionService.FetchError,
+       case let .network(cause) = error,
+       cause is CancellationError {
+        return true
+    }
+    if let error = error as? CodexSubscriptionService.FetchError,
+       case let .network(cause) = error,
+       cause is CancellationError {
+        return true
+    }
+    return false
+}
+
 struct CachedPayload {
     let payload: MenubarPayload
     let fetchedAt: Date
@@ -48,6 +63,11 @@ struct PayloadCacheKey: Hashable {
 @MainActor
 @Observable
 final class AppStore {
+    private struct QuotaRefreshToken {
+        let requestGeneration: Int
+        let lifecycleGeneration: Int
+    }
+
     var selectedProvider: ProviderFilter = .all
     var selectedPeriod: Period = .today
     var selectedScope: MenubarScope = MenubarScope.savedMenubarScope()
@@ -155,6 +175,13 @@ final class AppStore {
     var subscriptionError: String?
     var subscriptionLoadState: SubscriptionLoadState = ClaudeCredentialStore.isBootstrapCompleted ? .dormant : .notBootstrapped
     var capacityEstimates: [String: CapacityEstimate] = [:]
+    /// Early quota resets seen for each provider, keyed by dock provider id, and
+    /// this Mac's own record of how early past resets landed. Both are derived
+    /// from data already on disk on the existing refresh lifecycle — no polling
+    /// of its own, no network (#725).
+    var earlyResetEvents: [String: EarlyQuotaResetEvent] = [:]
+    var earlyResetHistory: [EarlyQuotaResetHistory.Summary] = []
+    @ObservationIgnored var earlyQuotaResetMonitor = EarlyQuotaResetMonitor()
 
     var codexUsage: CodexUsage?
     var codexError: String?
@@ -200,6 +227,24 @@ final class AppStore {
     var capacityDockProviderTransientFailures: Set<String> = []
     private var capacityDockProviderRefreshGenerations: [String: UInt64] = [:]
     @ObservationIgnored var capacityDockProviderQuotaService = CapacityDockProviderQuotaService.shared
+    /// Injectable seams keep the quota refresh state machine testable without
+    /// making the production tests contact provider endpoints.
+    @ObservationIgnored var claudeQuotaFetcher: @Sendable () async throws -> SubscriptionUsage? = {
+        try await ClaudeSubscriptionService.refreshIfBootstrapped()
+    }
+    @ObservationIgnored var codexQuotaFetcher: @Sendable () async throws -> CodexUsage? = {
+        try await CodexSubscriptionService.refreshIfBootstrapped()
+    }
+    @ObservationIgnored var claudeQuotaBootstrapChecker: @Sendable () -> Bool = {
+        ClaudeCredentialStore.isBootstrapCompleted
+    }
+    @ObservationIgnored var codexQuotaBootstrapChecker: @Sendable () -> Bool = {
+        CodexCredentialStore.isBootstrapCompleted
+    }
+    /// Watches the reset-credit inventory that already rides every successful
+    /// Codex usage fetch and notices when OpenAI banks a new one. Injectable so
+    /// tests never touch the real notification centre or the cache directory.
+    @ObservationIgnored var codexBankedResetAnnouncer = CodexBankedResetAnnouncer()
     @ObservationIgnored var capacityDockCredentialLoader:
         @Sendable (String) async throws -> CapacityDockProviderCredential = {
             try await CapacityDockProviderCredentialStore.loadAsync(for: $0)
@@ -235,6 +280,15 @@ final class AppStore {
     /// resume after the await and re-populate the freshly-cleared state.
     private var claudeRefreshGen: Int = 0
     private var codexRefreshGen: Int = 0
+    /// Request tokens keep overlapping manual/cadence refreshes from restoring
+    /// an older state over a newer request. The lifecycle generation above still
+    /// handles disconnect; these tokens handle ordinary request supersession.
+    private var claudeRefreshRequestGen: Int = 0
+    private var codexRefreshRequestGen: Int = 0
+    private var claudeRefreshInFlightRequest: Int?
+    private var codexRefreshInFlightRequest: Int?
+    private var claudeRefreshRestoreState: SubscriptionLoadState?
+    private var codexRefreshRestoreState: SubscriptionLoadState?
     private var kimiRefreshGen: Int = 0
     private var geminiRefreshGen: Int = 0
     private var copilotRefreshGen: Int = 0
@@ -1389,6 +1443,74 @@ final class AppStore {
         await bootstrapCodex()
     }
 
+    private func beginClaudeQuotaRefresh() -> QuotaRefreshToken {
+        claudeRefreshRequestGen &+= 1
+        let token = QuotaRefreshToken(
+            requestGeneration: claudeRefreshRequestGen,
+            lifecycleGeneration: claudeRefreshGen
+        )
+        if claudeRefreshInFlightRequest == nil {
+            claudeRefreshRestoreState = subscriptionLoadState
+        }
+        claudeRefreshInFlightRequest = token.requestGeneration
+        // A populated subscription remains available to the plan bar, but its
+        // pace projection must be treated as stale for the whole await.
+        subscriptionLoadState = .loading
+        return token
+    }
+
+    private func isCurrentClaudeQuotaRefresh(_ token: QuotaRefreshToken) -> Bool {
+        token.lifecycleGeneration == claudeRefreshGen
+            && token.requestGeneration == claudeRefreshRequestGen
+            && claudeRefreshInFlightRequest == token.requestGeneration
+    }
+
+    private func finishClaudeQuotaRefresh(_ token: QuotaRefreshToken) {
+        guard isCurrentClaudeQuotaRefresh(token) else { return }
+        claudeRefreshInFlightRequest = nil
+        claudeRefreshRestoreState = nil
+    }
+
+    private func restoreClaudeQuotaRefresh(_ token: QuotaRefreshToken) {
+        guard isCurrentClaudeQuotaRefresh(token) else { return }
+        subscriptionLoadState = claudeRefreshRestoreState
+            ?? (subscription == nil ? .failed : .loaded)
+        finishClaudeQuotaRefresh(token)
+    }
+
+    private func beginCodexQuotaRefresh() -> QuotaRefreshToken {
+        codexRefreshRequestGen &+= 1
+        let token = QuotaRefreshToken(
+            requestGeneration: codexRefreshRequestGen,
+            lifecycleGeneration: codexRefreshGen
+        )
+        if codexRefreshInFlightRequest == nil {
+            codexRefreshRestoreState = codexLoadState
+        }
+        codexRefreshInFlightRequest = token.requestGeneration
+        codexLoadState = .loading
+        return token
+    }
+
+    private func isCurrentCodexQuotaRefresh(_ token: QuotaRefreshToken) -> Bool {
+        token.lifecycleGeneration == codexRefreshGen
+            && token.requestGeneration == codexRefreshRequestGen
+            && codexRefreshInFlightRequest == token.requestGeneration
+    }
+
+    private func finishCodexQuotaRefresh(_ token: QuotaRefreshToken) {
+        guard isCurrentCodexQuotaRefresh(token) else { return }
+        codexRefreshInFlightRequest = nil
+        codexRefreshRestoreState = nil
+    }
+
+    private func restoreCodexQuotaRefresh(_ token: QuotaRefreshToken) {
+        guard isCurrentCodexQuotaRefresh(token) else { return }
+        codexLoadState = codexRefreshRestoreState
+            ?? (codexUsage == nil ? .failed : .loaded)
+        finishCodexQuotaRefresh(token)
+    }
+
     func bootstrapSubscription() async {
         subscriptionLoadState = .bootstrapping
         do {
@@ -1396,7 +1518,7 @@ final class AppStore {
             subscription = usage
             subscriptionError = nil
             subscriptionLoadState = .loaded
-            await captureSnapshots(for: usage)
+            await captureSnapshots(for: usage, baselineIsTrusted: false)
         } catch let err as ClaudeSubscriptionService.FetchError {
             applyFetchError(err)
         } catch {
@@ -1416,36 +1538,59 @@ final class AppStore {
     /// rather than every attempt.
     @discardableResult
     func refreshSubscriptionReportingSuccess() async -> Bool {
-        guard ClaudeCredentialStore.isBootstrapCompleted else {
+        guard claudeQuotaBootstrapChecker() else {
             if subscriptionLoadState != .notBootstrapped {
                 subscriptionLoadState = .notBootstrapped
             }
             return false
         }
-        let gen = claudeRefreshGen
-        if subscription == nil { subscriptionLoadState = .loading }
+        // Read before `beginClaudeQuotaRefresh` moves the state to `.loading`;
+        // with a refresh already in flight the restore state is the real one.
+        let stateBeforeFetch = claudeRefreshInFlightRequest == nil
+            ? subscriptionLoadState
+            : (claudeRefreshRestoreState ?? subscriptionLoadState)
+        let token = beginClaudeQuotaRefresh()
         do {
-            guard let usage = try await ClaudeSubscriptionService.refreshIfBootstrapped() else {
+            guard let usage = try await claudeQuotaFetcher() else {
+                restoreClaudeQuotaRefresh(token)
                 return false
             }
             // Disconnect-during-fetch guard: if the user clicked Disconnect
             // while we were awaiting Anthropic, the generation token will
             // have advanced and we must drop this result instead of writing
             // it back over the freshly-cleared state.
-            guard gen == claudeRefreshGen else { return false }
+            guard isCurrentClaudeQuotaRefresh(token) else { return false }
+            guard !Task.isCancelled else {
+                restoreClaudeQuotaRefresh(token)
+                return false
+            }
             subscription = usage
             subscriptionError = nil
             subscriptionLoadState = .loaded
-            await captureSnapshots(for: usage)
+            finishClaudeQuotaRefresh(token)
+            await captureSnapshots(
+                for: usage,
+                baselineIsTrusted: stateBeforeFetch.earlyResetBaselineIsTrusted
+            )
             return true
         } catch let err as ClaudeSubscriptionService.FetchError {
-            guard gen == claudeRefreshGen else { return false }
+            guard isCurrentClaudeQuotaRefresh(token) else { return false }
+            if Task.isCancelled || quotaFetchWasCancelled(err) {
+                restoreClaudeQuotaRefresh(token)
+                return false
+            }
             applyFetchError(err)
+            finishClaudeQuotaRefresh(token)
             return false
         } catch {
-            guard gen == claudeRefreshGen else { return false }
+            guard isCurrentClaudeQuotaRefresh(token) else { return false }
+            if Task.isCancelled || quotaFetchWasCancelled(error) {
+                restoreClaudeQuotaRefresh(token)
+                return false
+            }
             subscriptionError = sanitizeForUI(error.localizedDescription)
             subscriptionLoadState = .failed
+            finishClaudeQuotaRefresh(token)
             return false
         }
     }
@@ -1460,11 +1605,17 @@ final class AppStore {
         // Bump the generation token so any in-flight refreshSubscription that
         // resumes after this point detects the disconnect and discards its
         // result instead of re-populating the cleared state.
+        let refreshRestoreState = claudeRefreshRestoreState
         claudeRefreshGen &+= 1
+        claudeRefreshInFlightRequest = nil
+        claudeRefreshRestoreState = nil
         guard result.isSuccess else {
             // Nothing was removed, so nothing is disconnected. Leave the
             // connected state exactly as it was — the bootstrap flag is still
             // set, Disconnect stays available, and the banner says to retry.
+            if let refreshRestoreState {
+                subscriptionLoadState = refreshRestoreState
+            }
             subscriptionError = "Could not fully remove the local Claude credential cache. Disconnect again to retry."
             return
         }
@@ -1472,6 +1623,9 @@ final class AppStore {
         subscriptionError = nil
         subscriptionLoadState = .notBootstrapped
         capacityEstimates = [:]
+        earlyResetEvents[CapacityDockProvider.claude.rawValue] = nil
+        earlyResetHistory = []
+        earlyQuotaResetMonitor.forget(providerID: CapacityDockProvider.claude.rawValue)
         Task.detached { await SubscriptionSnapshotStore.clearAll() }
         // Notify the AppDelegate to clear its cadence-loop anchor so the next
         // reconnect doesn't measure against a pre-disconnect timestamp.
@@ -1487,6 +1641,7 @@ final class AppStore {
             codexUsage = usage
             codexError = nil
             codexLoadState = .loaded
+            await codexBankedResetAnnouncer.observe(usage.resetCredits)
         } catch let err as CodexSubscriptionService.FetchError {
             applyCodexFetchError(err)
         } catch {
@@ -1501,49 +1656,78 @@ final class AppStore {
 
     @discardableResult
     func refreshCodexReportingSuccess() async -> Bool {
-        if case .dormant = codexLoadState, !CodexCredentialStore.isBootstrapCompleted {
+        if case .dormant = codexLoadState, !codexQuotaBootstrapChecker() {
             await bootstrapCodex()
             return codexLoadState == .loaded
         }
-        guard CodexCredentialStore.isBootstrapCompleted else {
+        guard codexQuotaBootstrapChecker() else {
             if codexLoadState != .notBootstrapped { codexLoadState = .notBootstrapped }
             return false
         }
-        let gen = codexRefreshGen
-        if codexUsage == nil { codexLoadState = .loading }
+        let token = beginCodexQuotaRefresh()
         do {
-            guard let usage = try await CodexSubscriptionService.refreshIfBootstrapped() else {
+            guard let usage = try await codexQuotaFetcher() else {
+                restoreCodexQuotaRefresh(token)
                 return false
             }
-            guard gen == codexRefreshGen else { return false }
+            guard isCurrentCodexQuotaRefresh(token) else { return false }
+            guard !Task.isCancelled else {
+                restoreCodexQuotaRefresh(token)
+                return false
+            }
             codexUsage = usage
             codexError = nil
             codexLoadState = .loaded
+            finishCodexQuotaRefresh(token)
+            // After the refresh is finished, not inside it: announcing is a
+            // side-effect of a successful fetch and must not be able to hold the
+            // single-flight token open.
+            await codexBankedResetAnnouncer.observe(usage.resetCredits)
             return true
         } catch let err as CodexSubscriptionService.FetchError {
-            guard gen == codexRefreshGen else { return false }
+            guard isCurrentCodexQuotaRefresh(token) else { return false }
+            if Task.isCancelled || quotaFetchWasCancelled(err) {
+                restoreCodexQuotaRefresh(token)
+                return false
+            }
             applyCodexFetchError(err)
+            finishCodexQuotaRefresh(token)
             return false
         } catch {
-            guard gen == codexRefreshGen else { return false }
+            guard isCurrentCodexQuotaRefresh(token) else { return false }
+            if Task.isCancelled || quotaFetchWasCancelled(error) {
+                restoreCodexQuotaRefresh(token)
+                return false
+            }
             codexError = sanitizeForUI(error.localizedDescription)
             codexLoadState = .failed
+            finishCodexQuotaRefresh(token)
             return false
         }
     }
 
     func disconnectCodex() {
         let result = CodexSubscriptionService.disconnect()
+        let refreshRestoreState = codexRefreshRestoreState
         codexRefreshGen &+= 1
+        codexRefreshInFlightRequest = nil
+        codexRefreshRestoreState = nil
         guard result.isSuccess else {
             // Nothing removed means nothing disconnected; keep state intact so
             // Disconnect stays available for a retry.
+            if let refreshRestoreState {
+                codexLoadState = refreshRestoreState
+            }
             codexError = "Could not fully remove the local Codex credential cache. Disconnect again to retry."
             return
         }
         codexUsage = nil
         codexError = nil
         codexLoadState = .notBootstrapped
+        // Same reason the snapshot store is wiped on the Claude side: a
+        // reconnect under a different account must baseline again rather than
+        // announce that account's entire inventory as new grants.
+        Task.detached { await CodexBankedResetStore.clearAll() }
         NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
     }
 
@@ -1957,6 +2141,22 @@ final class AppStore {
         return cleaned
     }
 
+    /// The early-reset band for one dock provider, while it is still recent.
+    func capacityDockEarlyResetNotice(
+        for provider: CapacityDockProvider,
+        now: Date = Date()
+    ) -> EarlyQuotaResetEvent? {
+        guard let event = earlyResetEvents[provider.rawValue] else { return nil }
+        return EarlyQuotaResetNotice.isVisible(event, now: now) ? event : nil
+    }
+
+    /// This Mac's own early-reset pattern for the provider's windows, for the
+    /// quota hover card. Only Claude persists the snapshots this is derived from.
+    func earlyResetHistoryCaptions(for filter: ProviderFilter) -> [String] {
+        guard filter == .claude else { return [] }
+        return earlyResetHistory.map(\.caption)
+    }
+
     /// Snapshot of live quota state for a given provider. Returns nil when the user
     /// has not connected yet — the bar slot stays empty so we never trigger a
     /// source-owned Keychain prompt at startup. Once bootstrapped, the bar persists across all
@@ -1965,48 +2165,60 @@ final class AppStore {
     /// Aggregate quota status across all connected providers, used by the menu
     /// bar flame icon (color) and the popover warning row. Severity = worst
     /// observed across any provider's worst window. Warning providers are
-    /// every connected provider at >= 70% utilization.
+    /// every connected provider at >= 70% utilization, each carrying the window
+    /// that put it there so the row can name it (`QuotaWarningPresentation`).
     struct AggregateQuotaStatus {
         let severity: QuotaSummary.Severity
-        let warnings: [(name: String, percent: Double)]   // sorted desc by percent
+        let warnings: [QuotaWarning]   // sorted desc by percent
     }
 
     var aggregateQuotaStatus: AggregateQuotaStatus {
-        var providers: [(name: String, percent: Double)] = []
+        var providers: [QuotaWarning] = []
+        func include(_ name: String, _ windows: [QuotaWarning.Candidate]) {
+            if let worst = QuotaWarning.worst(name: name, windows: windows) { providers.append(worst) }
+        }
         if let usage = subscription, shouldIncludeCachedQuota(loadState: subscriptionLoadState) {
-            let worst = [
-                usage.fiveHourPercent,
-                usage.sevenDayPercent,
-                usage.sevenDayOpusPercent,
-                usage.sevenDaySonnetPercent,
-            ].compactMap { $0 }.max() ?? 0
-            if worst > 0 { providers.append(("Claude", worst)) }
+            // Labelled as `claudeQuotaSummary` labels them, so the warning row
+            // names a window the way the Plan tab and the Capacity Dock do.
+            include("Claude", [
+                .init(label: "5-hour", percent: usage.fiveHourPercent, resetsAt: usage.fiveHourResetsAt),
+                .init(label: "Weekly", percent: usage.sevenDayPercent, resetsAt: usage.sevenDayResetsAt),
+                .init(label: "Weekly · Opus", percent: usage.sevenDayOpusPercent, resetsAt: usage.sevenDayOpusResetsAt),
+                .init(label: "Weekly · Sonnet", percent: usage.sevenDaySonnetPercent, resetsAt: usage.sevenDaySonnetResetsAt),
+            ])
         }
         if let usage = codexUsage, shouldIncludeCachedQuota(loadState: codexLoadState) {
-            let worst = max(usage.primary?.usedPercent ?? 0, usage.secondary?.usedPercent ?? 0)
-            if worst > 0 { providers.append(("Codex", worst)) }
+            include("Codex", [usage.primary, usage.secondary].compactMap { $0 }.map {
+                QuotaWarning.Candidate(label: $0.windowLabel, percent: $0.usedPercent, resetsAt: $0.resetsAt)
+            })
         }
         if let usage = kimiUsage, shouldIncludeCachedQuota(loadState: kimiLoadState) {
-            let worst = max(usage.primary?.usedPercent ?? 0, usage.details.map(\.usedPercent).max() ?? 0)
-            if worst > 0 { providers.append(("Kimi Code", worst)) }
+            var windows: [QuotaWarning.Candidate] = []
+            if let w = usage.primary {
+                windows.append(.init(label: w.label, percent: w.usedPercent, resetsAt: w.resetsAt))
+            }
+            windows += usage.details.map {
+                QuotaWarning.Candidate(label: $0.label, percent: $0.usedPercent, resetsAt: $0.resetsAt)
+            }
+            include("Kimi Code", windows)
         }
         if let usage = geminiUsage, shouldIncludeCachedQuota(loadState: geminiLoadState) {
-            let worst = usage.details.map(\.usedPercent).max() ?? 0
-            if worst > 0 { providers.append(("Gemini", worst)) }
+            include("Gemini", usage.details.map {
+                QuotaWarning.Candidate(label: $0.label, percent: $0.usedPercent, resetsAt: $0.resetsAt)
+            })
         }
         if let usage = copilotUsage, shouldIncludeCachedQuota(loadState: copilotLoadState) {
-            let worst = usage.details.map(\.usedPercent).max() ?? 0
-            if worst > 0 { providers.append(("Copilot", worst)) }
+            include("Copilot", usage.details.map {
+                QuotaWarning.Candidate(label: $0.label, percent: $0.usedPercent, resetsAt: $0.resetsAt)
+            })
         }
         if let usage = antigravityUsage, shouldIncludeCachedQuota(loadState: antigravityLoadState) {
-            let worst = usage.details.map(\.usedPercent).max() ?? 0
-            if worst > 0 { providers.append(("Antigravity", worst)) }
+            include("Antigravity", usage.details.map {
+                QuotaWarning.Candidate(label: $0.label, percent: $0.usedPercent, resetsAt: $0.resetsAt)
+            })
         }
-        let worst = providers.map(\.percent).max() ?? 0
-        let severity = QuotaSummary.severity(for: worst / 100)
-        let sorted = providers.sorted { $0.percent > $1.percent }
-        let warnings = sorted.filter { $0.percent >= 70 }
-        return AggregateQuotaStatus(severity: severity, warnings: warnings)
+        let result = QuotaWarningPresentation.aggregate(providers)
+        return AggregateQuotaStatus(severity: result.severity, warnings: result.warnings)
     }
 
     private func shouldIncludeCachedQuota(loadState: SubscriptionLoadState) -> Bool {
@@ -2047,27 +2259,24 @@ final class AppStore {
         return todayPayload?.current
     }
 
-    /// Connected providers that report a headline quota window, as plain values.
-    /// Bounded on purpose: the six adapters with a native quota path, plus the
+    /// Providers that report a quota window, as plain values. Bounded on
+    /// purpose: the six adapters with a native quota path, plus the
     /// CodeBurn-owned adapters whose summary has already been fetched. Nothing
     /// here starts a fetch, so the menu-bar title stays a pure read.
+    ///
+    /// Which window each provider contributes, and which connection states still
+    /// count, are `MenubarQuotaRowSelection`'s business — it takes the worst
+    /// window, the same one the flame tints by, and keeps a backing-off provider
+    /// on its last-known data the way the Capacity Dock does.
     var menubarQuotaCandidates: [MenubarQuotaCandidate] {
         var candidates: [MenubarQuotaCandidate] = []
         var seen: Set<String> = []
 
         func append(label: String, summary: QuotaSummary?) {
             guard let summary,
-                  summary.connection == .connected || summary.connection == .stale,
-                  let window = summary.headlineWindow,
-                  window.percent.isFinite,
+                  let candidate = MenubarQuotaRowSelection.candidate(label: label, summary: summary),
                   seen.insert(label).inserted else { return }
-            candidates.append(
-                MenubarQuotaCandidate(
-                    label: label,
-                    percentUsed: window.percent,
-                    resetsAt: window.resetsAt
-                )
-            )
+            candidates.append(candidate)
         }
 
         for provider in CapacityDockPreferences.supportedProviders {
@@ -2119,6 +2328,16 @@ final class AppStore {
             let present = rows.compactMap(value)
             return present.isEmpty ? nil : present.reduce(0, +)
         }
+        // Cache read is stricter than the other token fields: a tile whose rows
+        // are split across a legacy and a current CLI must not present a partial
+        // known sum as complete. If any ACTIVE row lacks the cache field, the
+        // tile reports none — an idle row (hasUsage false) carries a genuine
+        // zero and does not force unknown.
+        let cacheRead: Int? = {
+            let activeMissing = rows.contains { $0.hasUsage && $0.cacheReadTokens == nil }
+            guard !activeMissing else { return nil }
+            return sum(\.cacheReadTokens)
+        }()
         return ProviderDetail(
             id: id,
             label: provider.displayName,
@@ -2127,7 +2346,8 @@ final class AppStore {
             hasUsage: rows.contains { $0.hasUsage },
             inputTokens: sum(\.inputTokens),
             outputTokens: sum(\.outputTokens),
-            sessions: sum(\.sessions)
+            sessions: sum(\.sessions),
+            cacheReadTokens: cacheRead
         )
     }
 
@@ -2176,6 +2396,19 @@ final class AppStore {
             )
         }
         return nil
+    }
+
+    /// Whether a quota fetch for this provider is actually awaiting a response.
+    /// Claude and Codex now read `.stale` on sample age alone, which a manual
+    /// refresh cadence makes permanent, so the surfaces that say "refreshing"
+    /// have to ask. Every other provider still reaches `.stale` only from an
+    /// in-flight or just-failed fetch.
+    func quotaRefreshIsInFlight(for provider: CapacityDockProvider) -> Bool {
+        switch provider.legacyFilter {
+        case .claude: claudeRefreshInFlightRequest != nil
+        case .codex: codexRefreshInFlightRequest != nil
+        default: true
+        }
     }
 
     func capacityDockProviderIsConnected(_ provider: CapacityDockProvider) -> Bool {
@@ -2321,12 +2554,13 @@ final class AppStore {
         if case .notBootstrapped = subscriptionLoadState { return nil }
         if case .bootstrapping = subscriptionLoadState { return nil }
         if case .noCredentials = subscriptionLoadState { return nil }
+        let usageIsFresh = QuotaSummary.isFresh(fetchedAt: subscription?.fetchedAt)
 
         let connection: QuotaSummary.Connection = {
             switch subscriptionLoadState {
             case .notBootstrapped, .dormant, .bootstrapping, .noCredentials: return .disconnected
             case .loading: return subscription == nil ? .loading : .stale
-            case .loaded: return .connected
+            case .loaded: return usageIsFresh ? .connected : .stale
             case .failed: return subscription == nil ? .loading : .stale
             case let .terminalFailure(reason): return .terminalFailure(reason: reason)
             case .transientFailure: return .transientFailure
@@ -2336,22 +2570,44 @@ final class AppStore {
         var primary: QuotaSummary.Window?
         var details: [QuotaSummary.Window] = []
         if let usage = subscription {
+            // Claude's rate-limit windows are fixed lengths, so each row
+            // carries its validated duration for pace presentation.
             if let pct = usage.fiveHourPercent {
-                details.append(.init(label: "5-hour", percent: pct / 100, resetsAt: usage.fiveHourResetsAt))
+                details.append(.init(
+                    label: "5-hour", percent: pct / 100, resetsAt: usage.fiveHourResetsAt,
+                    windowSeconds: QuotaPacePresentation.claudeFiveHourSeconds,
+                    fetchedAt: usage.fetchedAt
+                ))
             }
             if let pct = usage.sevenDayPercent {
-                let weekly = QuotaSummary.Window(label: "Weekly", percent: pct / 100, resetsAt: usage.sevenDayResetsAt)
+                let weekly = QuotaSummary.Window(
+                    label: "Weekly", percent: pct / 100, resetsAt: usage.sevenDayResetsAt,
+                    windowSeconds: QuotaPacePresentation.claudeSevenDaySeconds,
+                    fetchedAt: usage.fetchedAt
+                )
                 primary = weekly
                 details.append(weekly)
             }
             if let pct = usage.sevenDayOpusPercent {
-                details.append(.init(label: "Weekly · Opus", percent: pct / 100, resetsAt: usage.sevenDayOpusResetsAt))
+                details.append(.init(
+                    label: "Weekly · Opus", percent: pct / 100, resetsAt: usage.sevenDayOpusResetsAt,
+                    windowSeconds: QuotaPacePresentation.claudeSevenDaySeconds,
+                    fetchedAt: usage.fetchedAt
+                ))
             }
             if let pct = usage.sevenDaySonnetPercent {
-                details.append(.init(label: "Weekly · Sonnet", percent: pct / 100, resetsAt: usage.sevenDaySonnetResetsAt))
+                details.append(.init(
+                    label: "Weekly · Sonnet", percent: pct / 100, resetsAt: usage.sevenDaySonnetResetsAt,
+                    windowSeconds: QuotaPacePresentation.claudeSevenDaySeconds,
+                    fetchedAt: usage.fetchedAt
+                ))
             }
             for scoped in usage.scopedWeekly {
-                details.append(.init(label: "Weekly · \(scoped.label)", percent: scoped.percent / 100, resetsAt: scoped.resetsAt))
+                details.append(.init(
+                    label: "Weekly · \(scoped.label)", percent: scoped.percent / 100, resetsAt: scoped.resetsAt,
+                    windowSeconds: QuotaPacePresentation.claudeSevenDaySeconds,
+                    fetchedAt: usage.fetchedAt
+                ))
             }
         }
         let plan = subscription?.tier.displayName
@@ -2362,12 +2618,13 @@ final class AppStore {
         if case .notBootstrapped = codexLoadState { return nil }
         if case .bootstrapping = codexLoadState { return nil }
         if case .noCredentials = codexLoadState { return nil }
+        let usageIsFresh = QuotaSummary.isFresh(fetchedAt: codexUsage?.fetchedAt)
 
         let connection: QuotaSummary.Connection = {
             switch codexLoadState {
             case .notBootstrapped, .dormant, .bootstrapping, .noCredentials: return .disconnected
             case .loading: return codexUsage == nil ? .loading : .stale
-            case .loaded: return .connected
+            case .loaded: return usageIsFresh ? .connected : .stale
             case .failed: return codexUsage == nil ? .loading : .stale
             case let .terminalFailure(reason): return .terminalFailure(reason: reason)
             case .transientFailure: return .transientFailure
@@ -2377,13 +2634,23 @@ final class AppStore {
         var primary: QuotaSummary.Window?
         var details: [QuotaSummary.Window] = []
         if let usage = codexUsage {
+            // Codex reports each rate window's length itself, so every row
+            // carries its own validated duration for pace presentation.
             if let w = usage.primary {
-                let row = QuotaSummary.Window(label: w.windowLabel, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                let row = QuotaSummary.Window(
+                    label: w.windowLabel, percent: w.usedPercent / 100, resetsAt: w.resetsAt,
+                    windowSeconds: w.limitWindowSeconds,
+                    fetchedAt: usage.fetchedAt
+                )
                 primary = row
                 details.append(row)
             }
             if let w = usage.secondary {
-                let row = QuotaSummary.Window(label: w.windowLabel, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                let row = QuotaSummary.Window(
+                    label: w.windowLabel, percent: w.usedPercent / 100, resetsAt: w.resetsAt,
+                    windowSeconds: w.limitWindowSeconds,
+                    fetchedAt: usage.fetchedAt
+                )
                 // Some Codex plans (free / guest tiers) only return a secondary
                 // window. Promote it to primary so the chip bar always has a
                 // data source instead of rendering as an empty track.
@@ -2396,10 +2663,18 @@ final class AppStore {
             // the main Codex window.
             for extra in usage.additionalLimits {
                 if let p = extra.primary, p.usedPercent > 0 {
-                    details.append(.init(label: "\(extra.name) · \(p.windowLabel)", percent: p.usedPercent / 100, resetsAt: p.resetsAt))
+                    details.append(.init(
+                        label: "\(extra.name) · \(p.windowLabel)", percent: p.usedPercent / 100, resetsAt: p.resetsAt,
+                        windowSeconds: p.limitWindowSeconds,
+                        fetchedAt: usage.fetchedAt
+                    ))
                 }
                 if let s = extra.secondary, s.usedPercent > 0 {
-                    details.append(.init(label: "\(extra.name) · \(s.windowLabel)", percent: s.usedPercent / 100, resetsAt: s.resetsAt))
+                    details.append(.init(
+                        label: "\(extra.name) · \(s.windowLabel)", percent: s.usedPercent / 100, resetsAt: s.resetsAt,
+                        windowSeconds: s.limitWindowSeconds,
+                        fetchedAt: usage.fetchedAt
+                    ))
                 }
             }
             // No rate windows here, so the allowance feeds the bar and badge.
@@ -2407,7 +2682,9 @@ final class AppStore {
                 let row = QuotaSummary.Window(
                     label: credits.shortLabel,
                     percent: credits.usedPercent / 100,
-                    resetsAt: credits.resetsAt
+                    resetsAt: credits.resetsAt,
+                    windowSeconds: credits.windowSeconds,
+                    fetchedAt: usage.fetchedAt
                 )
                 if primary == nil { primary = row }
                 details.append(row)
@@ -2433,6 +2710,12 @@ final class AppStore {
         }
         if codexUsage?.creditLimit == nil, codexUsage?.creditsUnlimited == true {
             footerLines.append("Credits · Unlimited")
+        }
+        // Limit-reset credits, banked ones included. Same sentence the Plan tab
+        // and `codeburn quota` print; omitted entirely when the account holds none.
+        if let resets = codexUsage?.resetCredits,
+           let line = CodexBankedResetPresentation.line(resets, now: Date()) {
+            footerLines.append(line)
         }
         return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: plan, footerLines: footerLines)
     }
@@ -2576,7 +2859,7 @@ final class AppStore {
     /// when the current window has just reset and projection from current data isn't meaningful.
     /// Also computes the effective_tokens consumed inside each 7-day window from local history,
     /// which the CapacityEstimator uses to derive the absolute token capacity per tier.
-    private func captureSnapshots(for usage: SubscriptionUsage) async {
+    private func captureSnapshots(for usage: SubscriptionUsage, baselineIsTrusted: Bool) async {
         let now = Date()
         let history = payload.history.daily
 
@@ -2587,6 +2870,13 @@ final class AppStore {
             ("seven_day_opus", usage.sevenDayOpusPercent, usage.sevenDayOpusResetsAt, nil),
             ("seven_day_sonnet", usage.sevenDaySonnetPercent, usage.sevenDaySonnetResetsAt, nil),
         ]
+        await detectEarlyResets(
+            captures: captures.map { ($0.key, $0.percent, $0.resetsAt) },
+            planLabel: usage.tier.displayName,
+            baselineIsTrusted: baselineIsTrusted,
+            now: now
+        )
+
         for capture in captures {
             guard let percent = capture.percent, let resetsAt = capture.resetsAt else { continue }
             await SubscriptionSnapshotStore.record(SubscriptionSnapshot(
@@ -2599,6 +2889,71 @@ final class AppStore {
         }
 
         await refreshCapacityEstimates()
+        await refreshEarlyResetHistory()
+    }
+
+    /// Hand this fetch's windows to the early-reset monitor, which compares them
+    /// against the previous fetch's readings and announces at most one event.
+    /// A window the API did not report this time is passed as absent rather than
+    /// omitted, so a window that comes and goes never reads as a reset.
+    private func detectEarlyResets(
+        captures: [(key: String, percent: Double?, resetsAt: Date?)],
+        planLabel: String?,
+        baselineIsTrusted: Bool,
+        now: Date
+    ) async {
+        let provider = CapacityDockProvider.claude
+        let observations = captures.map { capture in
+            EarlyQuotaResetMonitor.Observation(
+                windowKey: capture.key,
+                windowName: EarlyQuotaResetFormat.claudeWindowName(forKey: capture.key),
+                windowSeconds: Self.claudeWindowSeconds(forKey: capture.key),
+                reading: {
+                    guard let percent = capture.percent, let resetsAt = capture.resetsAt else { return nil }
+                    return EarlyQuotaResetReading(percent: percent, resetsAt: resetsAt, observedAt: now)
+                }()
+            )
+        }
+        await earlyQuotaResetMonitor.record(
+            providerID: provider.rawValue,
+            providerName: provider.displayName,
+            planLabel: planLabel,
+            baselineIsTrusted: baselineIsTrusted,
+            observations: observations,
+            now: now
+        )
+        earlyResetEvents[provider.rawValue] = earlyQuotaResetMonitor.visibleEvent(
+            providerID: provider.rawValue,
+            now: now
+        )
+    }
+
+    /// Claude's rate-limit windows are fixed lengths, the same durations the
+    /// pace captions project against.
+    private static func claudeWindowSeconds(forKey key: String) -> Int? {
+        switch key {
+        case "five_hour": QuotaPacePresentation.claudeFiveHourSeconds
+        case "seven_day", "seven_day_opus", "seven_day_sonnet": QuotaPacePresentation.claudeSevenDaySeconds
+        default: nil
+        }
+    }
+
+    /// Re-derive the "past resets came this early" captions from the snapshots
+    /// already on disk. Local only: no network, no external feed.
+    private func refreshEarlyResetHistory() async {
+        var summaries: [EarlyQuotaResetHistory.Summary] = []
+        for key in ["seven_day", "seven_day_opus", "seven_day_sonnet"] {
+            let snapshots = await SubscriptionSnapshotStore.snapshots(for: key)
+            if let summary = EarlyQuotaResetHistory.summarize(
+                snapshots: snapshots,
+                windowKey: key,
+                windowName: EarlyQuotaResetFormat.claudeWindowName(forKey: key),
+                windowSeconds: Self.claudeWindowSeconds(forKey: key)
+            ) {
+                summaries.append(summary)
+            }
+        }
+        earlyResetHistory = summaries
     }
 
     /// Sum effective tokens (input + 5*output + cache_creation + 0.1*cache_read) across the
@@ -2635,27 +2990,29 @@ final class AppStore {
 enum SupportedCurrency: String, CaseIterable, Identifiable {
     case USD, GBP, EUR, AUD, CAD, NZD, JPY, CNY, CHF, INR, BRL, SEK, SGD, HKD, KRW, MXN, ZAR, DKK, RON
     var id: String { rawValue }
+    /// "USD · US Dollar" — the code is never translated, the name is.
+    var pickerLabel: String { "\(rawValue) · \(displayName)" }
     var displayName: String {
         switch self {
-        case .USD: "US Dollar"
-        case .GBP: "British Pound"
-        case .EUR: "Euro"
-        case .AUD: "Australian Dollar"
-        case .CAD: "Canadian Dollar"
-        case .NZD: "New Zealand Dollar"
-        case .JPY: "Japanese Yen"
-        case .CNY: "Chinese Yuan"
-        case .CHF: "Swiss Franc"
-        case .INR: "Indian Rupee"
-        case .BRL: "Brazilian Real"
-        case .SEK: "Swedish Krona"
-        case .SGD: "Singapore Dollar"
-        case .HKD: "Hong Kong Dollar"
-        case .KRW: "South Korean Won"
-        case .MXN: "Mexican Peso"
-        case .ZAR: "South African Rand"
-        case .DKK: "Danish Krone"
-        case .RON: "Romanian Leu"
+        case .USD: L("US Dollar")
+        case .GBP: L("British Pound")
+        case .EUR: L("Euro")
+        case .AUD: L("Australian Dollar")
+        case .CAD: L("Canadian Dollar")
+        case .NZD: L("New Zealand Dollar")
+        case .JPY: L("Japanese Yen")
+        case .CNY: L("Chinese Yuan")
+        case .CHF: L("Swiss Franc")
+        case .INR: L("Indian Rupee")
+        case .BRL: L("Brazilian Real")
+        case .SEK: L("Swedish Krona")
+        case .SGD: L("Singapore Dollar")
+        case .HKD: L("Hong Kong Dollar")
+        case .KRW: L("South Korean Won")
+        case .MXN: L("Mexican Peso")
+        case .ZAR: L("South African Rand")
+        case .DKK: L("Danish Krone")
+        case .RON: L("Romanian Leu")
         }
     }
 }
@@ -2693,6 +3050,12 @@ enum ProviderFilter: String, CaseIterable, Identifiable {
     case zcode = "ZCode"
 
     var id: String { rawValue }
+
+    /// Tab and empty-state label. Provider names are product names and stay
+    /// verbatim; only the synthetic "All" filter is translated.
+    var displayLabel: String {
+        self == .all ? L("All") : rawValue
+    }
 
     var providerKeys: [String] {
         switch self {
@@ -2766,6 +3129,21 @@ enum SubscriptionLoadState: Sendable, Equatable {
     case transientFailure(retryAt: Date?)  // 429 / network blip; backing off automatically
 }
 
+extension SubscriptionLoadState {
+    /// Whether the reading stored before this fetch can be compared against it.
+    /// A provider coming back from a terminal failure, a fresh bootstrap or no
+    /// credentials has a baseline from the far side of a gap, where stale state
+    /// looks like a jump. `.dormant` is a launch state, not a gap: its baseline
+    /// is the last successful fetch, and the skew, plan and new-cycle guards
+    /// still apply to it.
+    var earlyResetBaselineIsTrusted: Bool {
+        switch self {
+        case .loaded, .loading, .dormant, .failed, .transientFailure: true
+        case .notBootstrapped, .bootstrapping, .noCredentials, .terminalFailure: false
+        }
+    }
+}
+
 enum DisplayMetric: String {
     case cost, tokens, totalTokens, credits, iconOnly
 }
@@ -2779,6 +3157,19 @@ enum InsightMode: String, CaseIterable, Identifiable {
     case stats = "Stats"
     case optimize = "Optimize"
     var id: String { rawValue }
+
+    /// Tab label. `rawValue` stays the persisted identity.
+    var displayLabel: String {
+        switch self {
+        case .plan: L("Plan")
+        case .trend: L("Trend")
+        case .forecast: L("Forecast")
+        case .calendar: L("Calendar")
+        case .pulse: L("Pulse")
+        case .stats: L("Stats")
+        case .optimize: L("Optimize")
+        }
+    }
 }
 
 enum Period: String, CaseIterable, Identifiable {
@@ -2793,6 +3184,19 @@ enum Period: String, CaseIterable, Identifiable {
     case lifetime = "Life"
 
     var id: String { rawValue }
+
+    /// Segment label. `rawValue` stays the stable identity used for `id` and
+    /// for cache keys.
+    var displayLabel: String {
+        switch self {
+        case .today: L("Today")
+        case .sevenDays: L("7D")
+        case .thirtyDays: L("30D")
+        case .month: L("Month")
+        case .all: L("6M")
+        case .lifetime: L("Life")
+        }
+    }
 
     /// Maps to the CLI's `--period` argument values.
     var cliArg: String {
@@ -2810,12 +3214,12 @@ enum Period: String, CaseIterable, Identifiable {
 
     var menubarMetricLabel: String {
         switch self {
-        case .today: "Today"
-        case .sevenDays: "Week"
-        case .thirtyDays: "30 Days"
-        case .month: "Month"
-        case .all: "6 Months"
-        case .lifetime: "Lifetime"
+        case .today: L("Today")
+        case .sevenDays: L("Week")
+        case .thirtyDays: L("30 Days")
+        case .month: L("Month")
+        case .all: L("6 Months")
+        case .lifetime: L("Lifetime")
         }
     }
 
