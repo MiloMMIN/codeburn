@@ -164,7 +164,8 @@ describe('getModelCosts', () => {
 
     const known = ['anthropic', 'x-ai', 'xai', 'qwen', 'moonshotai', 'nousresearch', 'kimi',
       'litellm_proxy', 'openai_like', 'zhipu', 'mimo', 'xiaomi',
-      'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity', 'orcarouter']
+      'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity', 'orcarouter',
+      'cliproxy', 'zcode']
     for (const ns of known) {
       expect(getModelCosts(`${ns}/zzz-namespace-probe`), ns).not.toBeNull()
     }
@@ -186,12 +187,19 @@ describe('getModelCosts', () => {
       'omniroute:antigravity/zzz-router-probe',
       'omniroute:cmd/zzz-router-probe',
       'omniroute:orcarouter/zzz-router-probe',
+      'cliproxy/zzz-router-probe',
+      'omniroute:cliproxy/zzz-router-probe',
+      // codex-cliproxy-gateway ids can carry a CLIProxyAPI provider path behind
+      // the `cliproxy/` wrapper; the wrapper peels and the known provider
+      // namespace strips, reaching the priced leaf.
+      'cliproxy/zcode/zzz-router-probe',
     ]
     for (const id of routed) expect(getModelCosts(id), id).not.toBeNull()
 
     expect(getModelCosts('omniroute:nosuchvendor/zzz-router-probe')).toBeNull()
     // A nested unknown vendor inside a known routing wrapper must fail closed.
     expect(getModelCosts('omniroute:orcarouter/nosuchvendor/zzz-router-probe')).toBeNull()
+    expect(getModelCosts('cliproxy/nosuchvendor/zzz-router-probe')).toBeNull()
   })
 
   it('lets a user price override for a bare id win over the routed catalog row', () => {
@@ -236,6 +244,8 @@ describe('resolveCanonicalModelId', () => {
     expect(resolveCanonicalModelId('kimi-k3')).toBe('kimi-k3')
     expect(resolveCanonicalModelId('accounts/fireworks/models/glm-5p2')).toBe('glm-5p2')
     expect(resolveCanonicalModelId('glm-5p2')).toBe('glm-5p2')
+    expect(resolveCanonicalModelId('cliproxy/claude-fable-5-1')).toBe('claude-fable-5-1')
+    expect(resolveCanonicalModelId('cliproxy/zcode/glm-5.3-flash')).toBe('glm-5.3-flash')
     expect(resolveCanonicalModelId('GLM-5.2')).toBe('glm-5p1')
     expect(resolveCanonicalModelId('gpt-5-fast')).toBe('gpt-5')
     expect(resolveCanonicalModelId('gpt-5-untracked-xyz')).toBe('gpt-5-untracked-xyz')
@@ -1126,6 +1136,28 @@ describe('findUnpricedModels', () => {
       { model: 'Sonnet 4.6', calls: 12, cost: 0, tokens: 500_000 },
     ])
     expect(unpriced).toEqual([{ model: 'Sonnet 4.6', calls: 12, tokens: 500_000 }])
+  })
+
+  it('does not mistake a Bedrock `-v1:0` version for an Ollama tag', () => {
+    // Claude Code with CLAUDE_CODE_USE_BEDROCK=1 records Bedrock's foundation-
+    // model id, which ends in `-v<major>:<minor>`. The colon used to read as
+    // a local `:tag`, so an unpriced Bedrock model was classed as free local
+    // inference and never reached the unpriced list. It is metered.
+    expect(isExpectedFreeModel('anthropic.claude-nonexistent-99-v1:0')).toBe(false)
+    expect(findUnpricedModels([
+      { model: 'anthropic.claude-nonexistent-99-v1:0', calls: 3, cost: 0, tokens: 1000 },
+    ])).toEqual([{ model: 'anthropic.claude-nonexistent-99-v1:0', calls: 3, tokens: 1000 }])
+    // A priced Bedrock id is still not "expected free" — its $0 would be a gap.
+    expect(isExpectedFreeModel('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe(false)
+    // Not every Bedrock id spells the `v`: OpenAI and Cohere ids on Bedrock
+    // end in a bare `-<major>:<minor>`, and they are metered all the same.
+    expect(isExpectedFreeModel('openai.gpt-oss-120b-1:0')).toBe(false)
+    expect(isExpectedFreeModel('cohere.rerank-v3-5:0')).toBe(false)
+    expect(isExpectedFreeModel('us-gov-west-1/openai.gpt-oss-20b-1:0')).toBe(false)
+    // Ollama tags keep their treatment; only the version shape is exempted.
+    expect(isExpectedFreeModel('qwen3.6:35b-a3b-bf16')).toBe(true)
+    expect(isExpectedFreeModel('gpt-oss:120b')).toBe(true)
+    expect(isExpectedFreeModel('llama3.1:8b-instruct-q4_K_M')).toBe(true)
   })
 
   it('flags zero-rate pricing stubs but not explicit zero-rate user overrides', async () => {

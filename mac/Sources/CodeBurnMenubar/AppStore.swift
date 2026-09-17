@@ -175,13 +175,8 @@ final class AppStore {
     var subscriptionError: String?
     var subscriptionLoadState: SubscriptionLoadState = ClaudeCredentialStore.isBootstrapCompleted ? .dormant : .notBootstrapped
     var capacityEstimates: [String: CapacityEstimate] = [:]
-    /// Early quota resets seen for each provider, keyed by dock provider id, and
-    /// this Mac's own record of how early past resets landed. Both are derived
-    /// from data already on disk on the existing refresh lifecycle — no polling
-    /// of its own, no network (#725).
-    var earlyResetEvents: [String: EarlyQuotaResetEvent] = [:]
-    var earlyResetHistory: [EarlyQuotaResetHistory.Summary] = []
     @ObservationIgnored var earlyQuotaResetMonitor = EarlyQuotaResetMonitor()
+    @ObservationIgnored var quotaCrossingMonitor = QuotaCrossingMonitor()
 
     var codexUsage: CodexUsage?
     var codexError: String?
@@ -1623,8 +1618,6 @@ final class AppStore {
         subscriptionError = nil
         subscriptionLoadState = .notBootstrapped
         capacityEstimates = [:]
-        earlyResetEvents[CapacityDockProvider.claude.rawValue] = nil
-        earlyResetHistory = []
         earlyQuotaResetMonitor.forget(providerID: CapacityDockProvider.claude.rawValue)
         Task.detached { await SubscriptionSnapshotStore.clearAll() }
         // Notify the AppDelegate to clear its cadence-loop anchor so the next
@@ -1642,6 +1635,9 @@ final class AppStore {
             codexError = nil
             codexLoadState = .loaded
             await codexBankedResetAnnouncer.observe(usage.resetCredits)
+            // A bootstrap is the far side of a gap, so this fetch only seeds a
+            // baseline — the same discipline `bootstrapSubscription` uses.
+            await detectCodexEarlyResets(baselineIsTrusted: false)
         } catch let err as CodexSubscriptionService.FetchError {
             applyCodexFetchError(err)
         } catch {
@@ -1664,6 +1660,11 @@ final class AppStore {
             if codexLoadState != .notBootstrapped { codexLoadState = .notBootstrapped }
             return false
         }
+        // Read before `beginCodexQuotaRefresh` moves the state to `.loading`;
+        // with a refresh already in flight the restore state is the real one.
+        let stateBeforeFetch = codexRefreshInFlightRequest == nil
+            ? codexLoadState
+            : (codexRefreshRestoreState ?? codexLoadState)
         let token = beginCodexQuotaRefresh()
         do {
             guard let usage = try await codexQuotaFetcher() else {
@@ -1683,6 +1684,9 @@ final class AppStore {
             // side-effect of a successful fetch and must not be able to hold the
             // single-flight token open.
             await codexBankedResetAnnouncer.observe(usage.resetCredits)
+            await detectCodexEarlyResets(
+                baselineIsTrusted: stateBeforeFetch.earlyResetBaselineIsTrusted
+            )
             return true
         } catch let err as CodexSubscriptionService.FetchError {
             guard isCurrentCodexQuotaRefresh(token) else { return false }
@@ -1724,6 +1728,7 @@ final class AppStore {
         codexUsage = nil
         codexError = nil
         codexLoadState = .notBootstrapped
+        earlyQuotaResetMonitor.forget(providerID: CapacityDockProvider.codex.rawValue)
         // Same reason the snapshot store is wiped on the Claude side: a
         // reconnect under a different account must baseline again rather than
         // announce that account's entire inventory as new grants.
@@ -2141,22 +2146,6 @@ final class AppStore {
         return cleaned
     }
 
-    /// The early-reset band for one dock provider, while it is still recent.
-    func capacityDockEarlyResetNotice(
-        for provider: CapacityDockProvider,
-        now: Date = Date()
-    ) -> EarlyQuotaResetEvent? {
-        guard let event = earlyResetEvents[provider.rawValue] else { return nil }
-        return EarlyQuotaResetNotice.isVisible(event, now: now) ? event : nil
-    }
-
-    /// This Mac's own early-reset pattern for the provider's windows, for the
-    /// quota hover card. Only Claude persists the snapshots this is derived from.
-    func earlyResetHistoryCaptions(for filter: ProviderFilter) -> [String] {
-        guard filter == .claude else { return [] }
-        return earlyResetHistory.map(\.caption)
-    }
-
     /// Snapshot of live quota state for a given provider. Returns nil when the user
     /// has not connected yet — the bar slot stays empty so we never trigger a
     /// source-owned Keychain prompt at startup. Once bootstrapped, the bar persists across all
@@ -2172,10 +2161,15 @@ final class AppStore {
         let warnings: [QuotaWarning]   // sorted desc by percent
     }
 
-    var aggregateQuotaStatus: AggregateQuotaStatus {
-        var providers: [QuotaWarning] = []
-        func include(_ name: String, _ windows: [QuotaWarning.Candidate]) {
-            if let worst = QuotaWarning.worst(name: name, windows: windows) { providers.append(worst) }
+    /// Every connected provider's quota windows, flattened. The warning banner
+    /// and the crossing notifier read the same list, so the two can never
+    /// disagree about what a provider is reporting.
+    var quotaWindows: [QuotaCrossingWindow] {
+        var windows: [QuotaCrossingWindow] = []
+        func include(_ name: String, _ candidates: [QuotaWarning.Candidate]) {
+            windows += candidates.map {
+                QuotaCrossingWindow(providerName: name, label: $0.label, percent: $0.percent, resetsAt: $0.resetsAt)
+            }
         }
         if let usage = subscription, shouldIncludeCachedQuota(loadState: subscriptionLoadState) {
             // Labelled as `claudeQuotaSummary` labels them, so the warning row
@@ -2217,6 +2211,19 @@ final class AppStore {
                 QuotaWarning.Candidate(label: $0.label, percent: $0.usedPercent, resetsAt: $0.resetsAt)
             })
         }
+        return windows
+    }
+
+    var aggregateQuotaStatus: AggregateQuotaStatus {
+        var order: [String] = []
+        var byProvider: [String: [QuotaWarning.Candidate]] = [:]
+        for window in quotaWindows {
+            if byProvider[window.providerName] == nil { order.append(window.providerName) }
+            byProvider[window.providerName, default: []].append(
+                .init(label: window.label, percent: window.percent, resetsAt: window.resetsAt)
+            )
+        }
+        let providers = order.compactMap { QuotaWarning.worst(name: $0, windows: byProvider[$0] ?? []) }
         let result = QuotaWarningPresentation.aggregate(providers)
         return AggregateQuotaStatus(severity: result.severity, warnings: result.warnings)
     }
@@ -2248,7 +2255,10 @@ final class AppStore {
     /// "none running".
     func capacityDockLiveSessions(for provider: CapacityDockProvider) -> [LiveSession]? {
         guard let block = menubarPayload?.liveSessions else { return nil }
-        return block.sessions.filter { $0.provider == provider.id }
+        // The CLI names providers by their own ids ("kimicode", "cursor-agent"),
+        // not by the dock's raw identifiers ("kimi"); match the payload ids.
+        let ids = provider.payloadProviderIDs
+        return block.sessions.filter { ids.contains($0.provider) }
     }
 
     /// Today's totals for the dock popover. The background loop keeps the
@@ -2684,7 +2694,9 @@ final class AppStore {
                     percent: credits.usedPercent / 100,
                     resetsAt: credits.resetsAt,
                     windowSeconds: credits.windowSeconds,
-                    fetchedAt: usage.fetchedAt
+                    fetchedAt: usage.fetchedAt,
+                    storageLabel: credits.storageLabel,
+                    usedUnits: credits.used
                 )
                 if primary == nil { primary = row }
                 details.append(row)
@@ -2889,7 +2901,6 @@ final class AppStore {
         }
 
         await refreshCapacityEstimates()
-        await refreshEarlyResetHistory()
     }
 
     /// Hand this fetch's windows to the early-reset monitor, which compares them
@@ -2922,8 +2933,48 @@ final class AppStore {
             observations: observations,
             now: now
         )
-        earlyResetEvents[provider.rawValue] = earlyQuotaResetMonitor.visibleEvent(
+    }
+
+    /// Hand Codex's freshly fetched windows to the same monitor. Codex windows
+    /// have no keys of their own, so each is identified by its pre-localization
+    /// `storageLabel` when the row has one, else by its display label (a period
+    /// or model name, which does not translate).
+    ///
+    /// A window with no `resetsAt` is passed with no reading, and one with no
+    /// validated duration with no duration: both make the detector say nothing.
+    private func detectCodexEarlyResets(baselineIsTrusted: Bool, now: Date = Date()) async {
+        guard let summary = codexQuotaSummary(filter: .codex) else { return }
+        let provider = CapacityDockProvider.codex
+        var observations: [EarlyQuotaResetMonitor.Observation] = []
+        var seen: Set<String> = []
+        for row in summary.details {
+            let identity = row.storageLabel ?? row.label
+            guard !identity.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let key = EarlyQuotaResetFormat.windowKey(forLabel: identity)
+            guard seen.insert(key).inserted else { continue }
+            observations.append(EarlyQuotaResetMonitor.Observation(
+                windowKey: key,
+                windowName: EarlyQuotaResetFormat.windowName(forLabel: identity),
+                windowSeconds: row.windowSeconds,
+                // `QuotaSummary.Window` carries a 0...1 fraction; the detector
+                // reasons in 0...100 points.
+                reading: row.resetsAt.map {
+                    EarlyQuotaResetReading(
+                        percent: row.percent * 100,
+                        resetsAt: $0,
+                        observedAt: now,
+                        usedUnits: row.usedUnits
+                    )
+                }
+            ))
+        }
+        guard !observations.isEmpty else { return }
+        await earlyQuotaResetMonitor.record(
             providerID: provider.rawValue,
+            providerName: provider.displayName,
+            planLabel: summary.planLabel,
+            baselineIsTrusted: baselineIsTrusted,
+            observations: observations,
             now: now
         )
     }
@@ -2936,24 +2987,6 @@ final class AppStore {
         case "seven_day", "seven_day_opus", "seven_day_sonnet": QuotaPacePresentation.claudeSevenDaySeconds
         default: nil
         }
-    }
-
-    /// Re-derive the "past resets came this early" captions from the snapshots
-    /// already on disk. Local only: no network, no external feed.
-    private func refreshEarlyResetHistory() async {
-        var summaries: [EarlyQuotaResetHistory.Summary] = []
-        for key in ["seven_day", "seven_day_opus", "seven_day_sonnet"] {
-            let snapshots = await SubscriptionSnapshotStore.snapshots(for: key)
-            if let summary = EarlyQuotaResetHistory.summarize(
-                snapshots: snapshots,
-                windowKey: key,
-                windowName: EarlyQuotaResetFormat.claudeWindowName(forKey: key),
-                windowSeconds: Self.claudeWindowSeconds(forKey: key)
-            ) {
-                summaries.append(summary)
-            }
-        }
-        earlyResetHistory = summaries
     }
 
     /// Sum effective tokens (input + 5*output + cache_creation + 0.1*cache_read) across the

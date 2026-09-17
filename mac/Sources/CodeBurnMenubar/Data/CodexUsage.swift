@@ -147,13 +147,19 @@ struct CodexUsage: Sendable, Equatable {
             }
             // The two figures are already grouped by the formatter above, so
             // they are substituted formatted and only the sentence is translated.
-            let base = L("Monthly usage limit · %@ / %@ credits", text(used), text(limit))
+            let base = L("Monthly usage limit · %1$@ / %2$@ credits", text(used), text(limit))
             return reached ? L("%@ · limit reached", base) : base
         }
 
         var shortLabel: String {
             reached ? L("Monthly usage limit · limit reached") : L("Monthly usage limit")
         }
+
+        /// The identity behind `shortLabel`: pre-localization and free of the
+        /// `reached` state, so the early-reset monitor's storage key and name
+        /// survive a language switch and do not flip at the limit boundary —
+        /// the goodwill reset the monitor announces happens exactly there.
+        var storageLabel: String { "Monthly usage limit" }
     }
 
     let plan: PlanType

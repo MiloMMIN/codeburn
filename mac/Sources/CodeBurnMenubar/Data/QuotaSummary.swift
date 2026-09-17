@@ -51,19 +51,36 @@ struct QuotaSummary: Equatable {
         /// preserved for legacy/unsupported summaries and is not fresh enough
         /// to support a pace projection.
         let fetchedAt: Date?
+        /// Pre-localization, state-independent name for this window, when the
+        /// adapter has one that differs from `label`. The early-reset monitor
+        /// keys and names windows from this when present: a display label that
+        /// translates (or carries state such as "· limit reached") must not
+        /// become storage identity, or a language switch drops the baseline
+        /// and two translated siblings collide on one key.
+        let storageLabel: String?
+        /// Absolute usage the provider reported for this window, in the
+        /// provider's own units (credits, requests…), when it reports one.
+        /// The percent alone cannot tell a vendor clearing the counter from a
+        /// limit that grew: both drop the ratio. Nil when the adapter has no
+        /// absolute figure.
+        let usedUnits: Double?
 
         init(
             label: String,
             percent: Double,
             resetsAt: Date?,
             windowSeconds: Int? = nil,
-            fetchedAt: Date? = nil
+            fetchedAt: Date? = nil,
+            storageLabel: String? = nil,
+            usedUnits: Double? = nil
         ) {
             self.label = label
             self.percent = percent
             self.resetsAt = resetsAt
             self.windowSeconds = windowSeconds
             self.fetchedAt = fetchedAt
+            self.storageLabel = storageLabel
+            self.usedUnits = usedUnits
         }
 
         /// A pace estimate is valid only while the underlying sample remains
@@ -79,17 +96,17 @@ struct QuotaSummary: Equatable {
     /// to "you're over" (red) — matches what the user expects from a warning
     /// indicator in the menu bar.
     static func severity(for percent: Double) -> Severity {
-        if percent >= 0.9 { return .danger }
-        if percent >= 0.75 { return .critical }
-        if percent >= 0.5 { return .warning }
+        if percent >= 0.95 { return .danger }
+        if percent >= 0.7 { return .critical }
+        if percent >= 0.6 { return .warning }
         return .normal
     }
 
     enum Severity {
-        case normal     // <50%   green
-        case warning    // 50-75% yellow
-        case critical   // 75-90% orange
-        case danger     // >=90%  red
+        case normal     // <60%   green
+        case warning    // 60-70% yellow
+        case critical   // 70-95% orange
+        case danger     // >=95%  red
     }
 
     /// The glance value (percent + color) for Capacity Dock. Every provider is
@@ -152,8 +169,8 @@ extension QuotaSummary.Window {
         let hours = minutes / 60
         let days = hours / 24
         // d/h/m are unit abbreviations; zh-Hans uses 天/小时/分.
-        if days > 0 { return L("%lldd %lldh", days, hours % 24) }
-        if hours > 0 { return L("%lldh %lldm", hours, minutes % 60) }
+        if days > 0 { return L("%1$lldd %2$lldh", days, hours % 24) }
+        if hours > 0 { return L("%1$lldh %2$lldm", hours, minutes % 60) }
         return L("%lldm", minutes)
     }
 

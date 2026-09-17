@@ -51,6 +51,19 @@ aggregate cache-write token total for reports, but prices the 1-hour portion at
 If the split fields are missing, the parser falls back to the legacy behavior
 and prices every cache write at the 5-minute rate.
 
+## Bedrock sessions
+
+The JSONL has no provider field; the only trace of how a call was billed is
+the model id. With `CLAUDE_CODE_USE_BEDROCK=1` the assistant messages record
+Bedrock's id — `anthropic.claude-haiku-4-5-20251001-v1:0`, or with the
+cross-region profile prefix the user configured, `us.anthropic.…` — where a
+direct-API session records `claude-haiku-4-5-20251001`. `getModelRoute` reads
+the shape, so the rows are `Haiku 4.5`, `Haiku 4.5 (Bedrock)` and
+`Haiku 4.5 (Bedrock us)`: three SKUs at three prices, kept apart on every
+surface (see "Model rows and billing routes" in `../architecture.md`). Vertex
+ids (`claude-…@20251001`) are not a route yet; the `@` suffix is stripped and
+they merge with the direct row.
+
 ## Caching
 
 None at the provider level. The daily aggregation cache (`src/daily-cache.ts`) reuses prior computed days.
@@ -67,20 +80,15 @@ Anthropic sometimes resets a usage window before its scheduled time. The menubar
 notices on the existing refresh lifecycle — no extra request — by comparing each
 fetch's windows against the previous fetch's readings, which are kept per window
 in `UserDefaults` alongside the record of what has already been announced.
-`SubscriptionSnapshotStore`'s 30 days of snapshots then give the local history
-caption ("Last 3 weekly resets came ~18h early"), derived from the stored reset
-times alone: a fixed window that starts at `t` ends at `t + length`, so a cycle
-that ends sooner than a full window after the previous cycle's scheduled end
-began early by the difference. Everything is local; nothing is fetched to
-produce it.
+Everything is local; nothing is fetched to produce it. A detected reset posts one
+system notification and nothing else: there is no persistent UI for it.
 
 The detection is deliberately quiet. It needs a validated window length (the
 fixed 5-hour and 7-day limits), a stored reset that has not yet passed, and
 either a reset time anchored to a genuinely new cycle or a fall of at least 40
 points that lands at or under 10%. A scheduled reset, a plan change, clock or
 timestamp skew, a window appearing or disappearing, a first observation and a
-reconnect after a terminal failure all produce nothing. Short windows get no
-history summary, the same discipline `QuotaPace` applies to its ETA.
+reconnect after a terminal failure all produce nothing.
 
 ## When fixing a bug here
 

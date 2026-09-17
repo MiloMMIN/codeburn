@@ -35,7 +35,7 @@ export type QuotaWindow = {
 }
 
 export type QuotaProvider = {
-  provider: 'claude' | 'codex' | 'gemini' | 'copilot' | 'antigravity' | 'kimi'
+  provider: 'claude' | 'codex' | 'gemini' | 'copilot' | 'antigravity' | 'kimi' | 'grokbot'
   connection: 'connected' | 'disconnected' | 'accessDenied' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
   primary: QuotaWindow | null
   details: QuotaWindow[]
@@ -138,6 +138,14 @@ export type HydrationState = {
 
 export type MenubarPayload = {
   generated: string
+  /** Consecutive active days across every provider, independent of the selected
+   *  period and provider filter. Omitted by CLIs that predate the field. */
+  streak?: number
+  /** Cost and calls for the headline windows this payload's live scan covered,
+   *  all from the one aggregation that produced it. A window that is absent was
+   *  not scanned, so the client falls back to that period's own payload.
+   *  Omitted entirely on scoped or filtered requests. */
+  periodTotals?: Partial<Record<'today' | 'week' | '30days' | 'month' | 'all' | 'lifetime', { cost: number; calls: number }>>
   // Optional: older CLIs omit it. Present and true only on a stale read-only
   // serve; absent otherwise. Absence must always be read as "assume fresh."
   stale?: boolean
@@ -176,6 +184,15 @@ export type MenubarPayload = {
       savingsUSD: number
       savingsBaselineModel: string
       calls: number
+      // Per-model token counts (src/menubar-json.ts buildTopModels): billable
+      // output, cache read = reused input, cache write separate. Optional:
+      // older CLIs omit them, and a row whose contributing legacy data lacked
+      // counts omits them even on a new CLI. Absent means unknown — render a
+      // dash, never zero, and never substitute a period-wide figure.
+      inputTokens?: number
+      outputTokens?: number
+      cacheReadTokens?: number
+      cacheWriteTokens?: number
     }>
     unpricedModels?: Array<{ model: string; calls: number; tokens: number }>
     localModelSavings: LocalModelSavings
@@ -508,6 +525,8 @@ export type BranchSpendCoverage = {
 export type BranchSpendProjectReport = {
   id: string
   label: string
+  /** Normalized `origin` remote; shared by every clone and worktree of a repo. */
+  originKey?: string | null
   totalCost: number
   branches: BranchSpendRow[]
   coverage: BranchSpendCoverage
@@ -600,7 +619,7 @@ export type DeviceScanResult = { found: ScannedDevice[] }
 // ————— src/act/report.ts buildActReportJson —————
 
 export type ActReportJson = {
-  totals: {
+  totals?: {
     realizedCostUSD: number
     measuredActions: number
   }
@@ -859,6 +878,8 @@ export type NormalizedMetric = { a: number | null; b: number | null; diff: numbe
 
 export type AggregateDayRow = { date: string; historyCost: number; detailCost: number; aggregateOnly: number }
 
+export type PeriodDayCost = { date: string; cost: number }
+
 export type PeriodHistoryBasis = {
   historyCost: { A: number; B: number }
   detailCost: { A: number; B: number }
@@ -882,6 +903,8 @@ export type PeriodDiffReport = {
     per100Calls: NormalizedMetric
     denominators: { perDay: string; per100Calls: string }
   }
+  /** Cost per local day for each side, zero-filled over every day in the range. */
+  daily: { A: PeriodDayCost[]; B: PeriodDayCost[] }
   coverage: {
     unpricedModelsA: Array<{ model: string; calls: number }>
     unpricedModelsB: Array<{ model: string; calls: number }>
