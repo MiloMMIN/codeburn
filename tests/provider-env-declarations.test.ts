@@ -68,6 +68,9 @@ const FILE_PROVIDERS: Record<string, string[]> = {
   // the cached report (parser.ts:2875/2888) cannot keep serving the previous
   // account's usage after a swap.
   'vercel-gateway.ts': ['vercel-gateway'],
+  'antigravity-tools.ts': ['antigravity-tools'],
+  'cc-switch.ts': ['cc-switch'],
+  'new-api.ts': ['new-api'],
 }
 
 // ── Allowlisted reads ────────────────────────────────────────────────────

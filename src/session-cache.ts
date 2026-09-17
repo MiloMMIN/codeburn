@@ -302,6 +302,9 @@ export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   // !readOnly), so an undeclared credential would keep serving the previous
   // account's usage after a swap — the exact #920 defect.
   'vercel-gateway': ['AI_GATEWAY_API_KEY', 'VERCEL_OIDC_TOKEN'],
+  'antigravity-tools': ['CODEBURN_ANTIGRAVITY_TOOLS_DIR', 'CODEBURN_ANTIGRAVITY_TOOLS_LOCAL_IPS', 'CODEBURN_ANTIGRAVITY_TOOLS_TOKENS_ONLY'],
+  'cc-switch': ['CODEBURN_CC_SWITCH_DIR'],
+  'new-api': ['CODEBURN_NEWAPI_DB', 'CODEBURN_NEWAPI_LOCAL_TOKENS', 'CODEBURN_NEWAPI_LOCAL_USERS'],
 }
 
 // Names of providers whose cache entries are never evicted when source files

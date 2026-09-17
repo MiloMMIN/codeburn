@@ -815,3 +815,178 @@ skipUnlessSqlite('devin provider sessions.db enrichment', () => {
     expect(calls).toEqual([])
   })
 })
+
+type MessageNodeSpec = {
+  sessionId: string
+  nodeId: number
+  createdAt: number
+  requestId?: string
+  messageId?: string
+  generationModel?: string
+  committedAcuCost?: number
+  metrics?: { input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_creation_tokens?: number }
+}
+
+function createSessionsDbWithMessages(messages: MessageNodeSpec[]): void {
+  const { DatabaseSync: Database } = require('node:sqlite')
+  const db = new Database(join(tmpDir, 'sessions.db'))
+  db.exec(`
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      working_directory TEXT,
+      backend_type TEXT,
+      model TEXT,
+      agent_mode TEXT,
+      created_at INTEGER,
+      last_activity_at INTEGER,
+      title TEXT,
+      hidden INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE message_nodes (
+      row_id INTEGER PRIMARY KEY,
+      session_id TEXT,
+      node_id INTEGER,
+      parent_node_id INTEGER,
+      chat_message TEXT,
+      created_at INTEGER,
+      metadata TEXT
+    );
+  `)
+  db.prepare(`
+    INSERT INTO sessions (id, working_directory, model, created_at, last_activity_at, title, hidden)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run('cli-session', '/Users/example/work/farm', 'swe-2-max', 1_800_000_000, 1_800_000_010, 'Farm', 0)
+  db.prepare(`
+    INSERT INTO sessions (id, working_directory, model, created_at, last_activity_at, title, hidden)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run('hidden-cli', '/Users/example/work/secret', 'swe-2-max', 1_800_000_000, 1_800_000_010, 'Secret', 1)
+  for (const [i, spec] of messages.entries()) {
+    const chatMessage = {
+      message_id: spec.messageId ?? `msg-${i}`,
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: `tc-${i}`, name: 'exec', arguments: {}, index: 0, kind: 'function' }],
+      metadata: {
+        request_id: spec.requestId ?? `req-${i}`,
+        ...(spec.generationModel ? { generation_model: spec.generationModel } : {}),
+        ...(spec.committedAcuCost != null ? { committed_acu_cost: spec.committedAcuCost } : {}),
+        ...(spec.metrics ? { metrics: spec.metrics } : {}),
+      },
+    }
+    db.prepare(`INSERT INTO message_nodes (session_id, node_id, chat_message, created_at) VALUES (?, ?, ?, ?)`)
+      .run(spec.sessionId, spec.nodeId, JSON.stringify(chatMessage), spec.createdAt)
+  }
+  db.close()
+}
+
+async function collectDbCalls(provider: ReturnType<typeof createDevinProvider>, dateRange?: { start: Date; end: Date }): Promise<ParsedProviderCall[]> {
+  const sources = await provider.discoverSessions()
+  const calls: ParsedProviderCall[] = []
+  for (const source of sources) {
+    for await (const call of provider.createSessionParser(source, new Set(), dateRange).parse()) calls.push(call)
+  }
+  return calls
+}
+
+skipUnlessSqlite('devin provider sessions.db message tree', () => {
+  it('discovers sessions.db as a source without acuUsdRate and prices calls from token metrics', async () => {
+    createSessionsDbWithMessages([
+      { sessionId: 'cli-session', nodeId: 1, createdAt: 1_800_000_100, requestId: 'r1', generationModel: 'claude-sonnet-4-6', metrics: { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_tokens: 0 } },
+    ])
+
+    const provider = createDevinProvider(tmpDir)
+    const sources = await provider.discoverSessions()
+    expect(sources).toEqual([
+      { path: join(tmpDir, 'sessions.db'), project: 'devin', provider: 'devin', sourceId: 'sessions-db' },
+    ])
+
+    const calls = await collectDbCalls(provider)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      model: 'claude-sonnet-4-6',
+      inputTokens: 1_000_000,
+      outputTokens: 1_000_000,
+      sessionId: 'cli-session',
+      project: 'farm',
+      projectPath: '/Users/example/work/farm',
+      deduplicationKey: 'devin:db:cli-session:r1',
+      timestamp: '2027-01-15T08:01:40.000Z',
+      costIsEstimated: true,
+      tools: ['exec'],
+    })
+    expect(calls[0]!.costUSD).toBeGreaterThan(0)
+  })
+
+  it('dedupes the same request_id appearing on multiple branch nodes', async () => {
+    createSessionsDbWithMessages([
+      { sessionId: 'cli-session', nodeId: 1, createdAt: 1_800_000_100, requestId: 'shared-req', metrics: { input_tokens: 100, output_tokens: 10 } },
+      { sessionId: 'cli-session', nodeId: 2, createdAt: 1_800_000_100, requestId: 'shared-req', metrics: { input_tokens: 100, output_tokens: 10 } },
+      { sessionId: 'cli-session', nodeId: 3, createdAt: 1_800_000_200, requestId: 'other-req', metrics: { input_tokens: 200, output_tokens: 20 } },
+    ])
+
+    const calls = await collectDbCalls(createDevinProvider(tmpDir))
+    expect(calls).toHaveLength(2)
+    expect(calls.map(c => c.deduplicationKey).sort()).toEqual([
+      'devin:db:cli-session:other-req',
+      'devin:db:cli-session:shared-req',
+    ])
+  })
+
+  it('skips hidden sessions and sessions covered by a transcript file', async () => {
+    await configureDevinRate()
+    createSessionsDbWithMessages([
+      { sessionId: 'hidden-cli', nodeId: 1, createdAt: 1_800_000_100, metrics: { input_tokens: 100, output_tokens: 10 } },
+      { sessionId: 'db-session', nodeId: 2, createdAt: 1_800_000_100, metrics: { input_tokens: 100, output_tokens: 10 } },
+      { sessionId: 'cli-session', nodeId: 3, createdAt: 1_800_000_100, metrics: { input_tokens: 100, output_tokens: 10 } },
+    ])
+    // createSessionsDbWithMessages leaves 'db-session' out of its sessions rows;
+    // give it one so the transcript branch treats it as a known session.
+    const { DatabaseSync: Database } = require('node:sqlite')
+    const db = new Database(join(tmpDir, 'sessions.db'))
+    db.prepare(`INSERT INTO sessions (id, working_directory, model, created_at, last_activity_at, title, hidden) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run('db-session', '/Users/example/work/dup', 'swe-2-max', 1_800_000_000, 1_800_000_010, 'Dup', 0)
+    db.close()
+    await writeTranscript('db-session.json', {
+      session_id: 'db-session',
+      steps: [{ step_id: 's1', metadata: { committed_acu_cost: 0.5 } }],
+    })
+
+    const calls = await collectDbCalls(createDevinProvider(tmpDir))
+    expect(calls).toHaveLength(2)
+    // db-session's single call came from its transcript (ACU path); the db
+    // message-tree row for the same session was skipped.
+    expect(calls.find(c => c.sessionId === 'db-session')?.deduplicationKey).toBe('devin:db-session:s1')
+    const dbCalls = calls.filter(c => c.deduplicationKey.startsWith('devin:db:'))
+    expect(dbCalls).toHaveLength(1)
+    expect(dbCalls[0]!.sessionId).toBe('cli-session')
+  })
+
+  it('bills committed_acu_cost through acuUsdRate when both are present', async () => {
+    await configureDevinRate(0.02)
+    createSessionsDbWithMessages([
+      { sessionId: 'cli-session', nodeId: 1, createdAt: 1_800_000_100, committedAcuCost: 2, metrics: { input_tokens: 500, output_tokens: 50 } },
+      { sessionId: 'cli-session', nodeId: 2, createdAt: 1_800_000_200, metrics: { input_tokens: 500, output_tokens: 50 } },
+    ])
+
+    const calls = await collectDbCalls(createDevinProvider(tmpDir))
+    expect(calls).toHaveLength(2)
+    const [acu, estimated] = calls
+    expect(acu!.costUSD).toBeCloseTo(0.04)
+    expect(acu!.costIsEstimated).toBeUndefined()
+    expect(estimated!.costIsEstimated).toBe(true)
+  })
+
+  it('applies dateRange to the message scan', async () => {
+    createSessionsDbWithMessages([
+      { sessionId: 'cli-session', nodeId: 1, createdAt: 1_700_000_000, metrics: { input_tokens: 100, output_tokens: 10 } },
+      { sessionId: 'cli-session', nodeId: 2, createdAt: 1_800_000_100, metrics: { input_tokens: 100, output_tokens: 10 } },
+    ])
+
+    const calls = await collectDbCalls(createDevinProvider(tmpDir), {
+      start: new Date(1_800_000_000 * 1000),
+      end: new Date(1_800_000_500 * 1000),
+    })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.timestamp).toBe('2027-01-15T08:01:40.000Z')
+  })
+})
