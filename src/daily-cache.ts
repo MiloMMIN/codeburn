@@ -221,10 +221,12 @@ const MIN_SUPPORTED_VERSION = 28
 const PENDING_REDERIVE_PROVIDER_VERSIONS: Readonly<Record<string, number>> = {
   copilot: 26,
   // 31: a v30 file may have been written by #1132's accounting, which never
-  // carried the Hermes cost contract. 33: day.models is keyed by route, and a
-  // v32 Hermes day cannot know which of its rows went through
-  // `billing_provider = bedrock` / `openrouter` (#1450).
-  hermes: 33,
+  // carried the Hermes cost contract. 34: day.models is keyed by route, and a
+  // pre-route Hermes day cannot know which of its rows went through
+  // `billing_provider = bedrock` / `openrouter` (#1450). Contracted at 34, not
+  // upstream's 33: this branch also shipped a v33 (Hermes guard + WorkBuddy),
+  // and caches that version wrote still hold raw-id model keys.
+  hermes: 34,
   // DSH v0-only parsing and exclusive-reasoning display were both stale in
   // finalized days written before the multi-generation reader.
   dsh: 32,

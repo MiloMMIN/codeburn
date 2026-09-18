@@ -88,9 +88,8 @@ const BUILTIN_PRICE_OVERRIDES: Record<string, SnapshotEntry> = {
   'composer-2': [0.5e-6, 2.5e-6, 0.5e-6, 0.2e-6],
   'composer-1.5': [3.5e-6, 17.5e-6, 3.5e-6, 0.35e-6],
   'composer-1': [1.25e-6, 10e-6, 1.25e-6, 0.125e-6],
-  // DeepSeek v4 series and Hunyuan house models observed in WorkBuddy
-  'deepseek-v4-pro': [0.66e-6, 1.98e-6, 0, 0.022e-6],
-  'deepseek-v4-flash': [0.22e-6, 0.66e-6, 0, 0.007e-6],
+  // Hunyuan house models observed in WorkBuddy (DeepSeek v4 prices come from
+  // the bundled snapshot; local overrides here were stale and shadowed it).
   'hy3': [0.132e-6, 0.528e-6, 0, 0.033e-6],
   'hy3-free': [0.132e-6, 0.528e-6, 0, 0.033e-6],
 }
