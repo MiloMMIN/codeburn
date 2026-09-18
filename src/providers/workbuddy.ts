@@ -34,7 +34,6 @@ export interface WorkBuddyConfig {
   displayName: string
   envVar: string
   defaultDirName: string
-  color: string
 }
 
 export const WORKBUDDY_CONFIG: WorkBuddyConfig = {
@@ -42,7 +41,6 @@ export const WORKBUDDY_CONFIG: WorkBuddyConfig = {
   displayName: 'WorkBuddy',
   envVar: 'WORKBUDDY_HOME',
   defaultDirName: '.workbuddy',
-  color: '#2563EB',
 }
 
 export const WORKBUDDYAI_CONFIG: WorkBuddyConfig = {
@@ -50,7 +48,6 @@ export const WORKBUDDYAI_CONFIG: WorkBuddyConfig = {
   displayName: 'WorkBuddy AI',
   envVar: 'WORKBUDDY_AI_HOME',
   defaultDirName: '.workbuddy-ai',
-  color: '#06B6D4',
 }
 
 export function getWorkBuddyHome(config: WorkBuddyConfig): string {
@@ -362,7 +359,6 @@ export function createWorkBuddyProvider(config: WorkBuddyConfig, overrideProject
   return {
     name: config.name,
     displayName: config.displayName,
-    color: config.color,
 
     modelDisplayName(model: string): string {
       return getShortModelName(model)

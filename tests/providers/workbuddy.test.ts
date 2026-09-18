@@ -32,11 +32,9 @@ describe('WorkBuddy and WorkBuddy AI providers', () => {
     it('declares expected identities', () => {
       expect(workbuddy.name).toBe('workbuddy')
       expect(workbuddy.displayName).toBe('WorkBuddy')
-      expect(workbuddy.color).toBe('#2563EB')
 
       expect(workbuddyai.name).toBe('workbuddyai')
       expect(workbuddyai.displayName).toBe('WorkBuddy AI')
-      expect(workbuddyai.color).toBe('#06B6D4')
     })
 
     it('normalizes tool display names to canonical vocabulary', () => {
