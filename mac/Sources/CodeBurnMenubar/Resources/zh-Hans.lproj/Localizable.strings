@@ -610,11 +610,6 @@
 "Automatic" = "自动";
 "CLI" = "命令行工具";
 "API" = "API";
-"ACU Conversion" = "ACU 换算";
-"USD per ACU" = "每 ACU 美元";
-"Save" = "存储";
-"CodeBurn reads Devin ACU usage from local transcripts only after this rate is configured, then multiplies each step by the rate before reporting cost." = "只有在配置了此汇率之后，CodeBurn 才会从本地记录中读取 Devin 的 ACU 用量，并在报告花费前将每一步乘以该汇率。";
-"Saved. Refresh CodeBurn to recalculate Devin cost." = "已存储。刷新 CodeBurn 以重新计算 Devin 花费。";
 "Version %@" = "版本 %@";
 "%@ is available. Choose Check for Updates in the CodeBurn menu to install it." = "%@ 已发布。在 CodeBurn 菜单中选择“检查更新”即可安装。";
 "GitHub" = "GitHub";

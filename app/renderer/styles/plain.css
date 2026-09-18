@@ -336,6 +336,13 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .pop-item:hover, .pop-item:focus-visible { background: var(--hover); }
 .pop-item.on { color: var(--accent-text); font-weight: 560; }
 .pop-item.muted { color: var(--mut); }
+/* Token breakdown behind a dollar amount: the pop-menu surface, small mono counts. */
+[data-usd] { cursor: help; }
+.usd-pop { min-width: 0; padding: 7px 9px; }
+.usd-pop-row { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-4); font-size: var(--fs-meta); line-height: 1.5; white-space: nowrap; }
+.usd-pop-row span { color: var(--mut); }
+.usd-pop-row b { font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: var(--fw-kpi); color: var(--ink); }
+.usd-pop-row.calls { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--line2); }
 .dropdown { max-width: 100%; }
 .dropdown-trigger { width: 100%; justify-content: space-between; border: 1px solid var(--line2); font: inherit; text-align: left; }
 .dropdown-trigger::after { content: none; }
@@ -643,7 +650,7 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-medium); }
 .ov-kpi-primary > span, .ov-kpi-primary > strong { color: var(--accent-text); }
 .ov-kpi-saved > strong { color: var(--ok); }
 /* The outer card is a hairline frame around the inner surface; the header row sits on that strip. */
-.ov-card { display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--card-shadow); padding: 0 2px 2px; }
+.ov-card { display: flex; min-width: 0; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--card-shadow); padding: 0 2px 2px; }
 .ov-panel-head { display: flex; flex: 0 0 auto; align-items: center; gap: var(--sp-2); min-height: 40px; margin: 0; padding: 0 17px; }
 .ov-panel-head > .icon { width: 16px; height: 16px; color: var(--mut2); }
 .ov-panel-body, .ov-card-inner { background: var(--card-inner); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--card-inner-shadow); padding: var(--sp-4); }
@@ -884,7 +891,10 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-medium); }
 .opt-copy:hover, .opt-copy:focus-visible { border-color: var(--accent); color: var(--ink); }
 .ov-analytics-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: stretch; }
 .ov-analytics-row > :only-child { grid-column: 1 / -1; }
-.ov-body-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 12px; }
+/* The sidebar eats 200px, so a viewport media query stacks these too late and the
+   models table would push its card over the right-hand one. Stack on the row's
+   own width instead: two columns only while each still gets a usable 420px. */
+.ov-body-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); align-items: start; gap: 12px; }
 .ov-main-column, .ov-side-column { display: grid; min-width: 0; gap: 12px; }
 .ov-outcome-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 10px; }
 .ov-outcome-metrics > div { display: flex; min-width: 0; flex-direction: column; gap: var(--sp-1); padding: var(--sp-3); border-right: 1px solid var(--line2); }

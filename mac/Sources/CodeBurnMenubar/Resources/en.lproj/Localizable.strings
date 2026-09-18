@@ -618,11 +618,6 @@
 "Automatic" = "Automatic";
 "CLI" = "CLI";
 "API" = "API";
-"ACU Conversion" = "ACU Conversion";
-"USD per ACU" = "USD per ACU";
-"Save" = "Save";
-"CodeBurn reads Devin ACU usage from local transcripts only after this rate is configured, then multiplies each step by the rate before reporting cost." = "CodeBurn reads Devin ACU usage from local transcripts only after this rate is configured, then multiplies each step by the rate before reporting cost.";
-"Saved. Refresh CodeBurn to recalculate Devin cost." = "Saved. Refresh CodeBurn to recalculate Devin cost.";
 "Version %@" = "Version %@";
 "%@ is available. Choose Check for Updates in the CodeBurn menu to install it." = "%@ is available. Choose Check for Updates in the CodeBurn menu to install it.";
 "GitHub" = "GitHub";

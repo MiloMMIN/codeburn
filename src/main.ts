@@ -2,7 +2,7 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
+import { findUnpricedModels, modelRowKey, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
 import { cachedProjectIdentitiesForRange } from './daily-cache.js'
 import { reportUnmatchedProjectPatterns } from './project-filter-warnings.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
@@ -14,7 +14,7 @@ import { renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
 import { statusSnapshotSemanticKey } from './status-snapshot-semantic.js'
 import { dateKey } from './day-aggregator.js'
-import { sessionModelBillableOutputTokens, inferSessionProvider } from './session-output.js'
+import { inferSessionProvider } from './session-output.js'
 import { isBehavioralCall } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import type { AppliedFix } from './act/types.js'
@@ -593,25 +593,24 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
 
   const modelMap: Record<string, { calls: number; cost: number; savings: number; estimatedCost: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; baselineModel: string }> = {}
   const modelEfficiency = aggregateModelEfficiency(projects)
-  for (const sess of sessions) {
-    for (const [model, d] of Object.entries(sess.modelBreakdown)) {
-      if (!modelMap[model]) { modelMap[model] = { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' } }
-      modelMap[model].calls += d.calls
-      modelMap[model].cost += d.costUSD
-      modelMap[model].savings += d.savingsUSD
-      modelMap[model].estimatedCost += d.estimatedCostUSD ?? 0
-      modelMap[model].inputTokens += d.tokens.inputTokens
-      modelMap[model].cacheReadTokens += d.tokens.cacheReadInputTokens
-      modelMap[model].cacheWriteTokens += d.tokens.cacheCreationInputTokens
-    }
-    // Output must be billed per call while provider identity is still known.
-    // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
-    for (const [model, output] of Object.entries(sessionModelBillableOutputTokens(sess))) {
-      if (!modelMap[model]) {
-        modelMap[model] = { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' }
-      }
-      modelMap[model].outputTokens += output
-    }
+  // Same durable day set as the headline and `daily`, so the rows sum to it:
+  // days whose transcripts have expired keep their models, and the pre-v14 ones
+  // that never had any show up as "Unknown (carried)". Day and session rows are
+  // keyed alike (modelRowKey), so the efficiency join below still lands.
+  for (const m of durable.data.models) {
+    // Day rows key by the raw provider id on days written before v33; resolve
+    // to the display name the same way buildTopModels does, so ids that
+    // collapse to one model land in one row.
+    const name = modelRowKey(m.name)
+    const acc = modelMap[name] ??= { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' }
+    acc.calls += m.calls
+    acc.cost += m.cost
+    acc.savings += m.savingsUSD ?? 0
+    acc.estimatedCost += m.estimatedCostUSD ?? 0
+    acc.inputTokens += m.inputTokens ?? 0
+    acc.outputTokens += m.outputTokens ?? 0
+    acc.cacheReadTokens += m.cacheReadTokens ?? 0
+    acc.cacheWriteTokens += m.cacheWriteTokens ?? 0
   }
   // Pull the active baseline model name out of the savings config so the
   // report can show what the local calls were mapped against without

@@ -33,7 +33,11 @@ function emptyDay(date: string, cost = 0, calls = 0): DailyEntry {
     cacheWriteTokens: 0,
     editTurns: 0,
     oneShotTurns: 0,
-    models: {},
+    // A day's model rows have to account for its calls and cost, or loading it
+    // credits the difference to the carried row.
+    models: calls || cost
+      ? { 'Opus 4.7': { calls, cost, savingsUSD: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } }
+      : {},
     categories: {},
     providers: {},
   }

@@ -141,6 +141,7 @@ final class CapacityDockController {
     private func glanceDetailHeight(for provider: CapacityDockProvider) -> CGFloat {
         return CapacityDockMetrics.detailHeight(
             quota: store.capacityDockQuotaSummary(for: provider),
+            provider: provider,
             sessionCount: store.capacityDockLiveSessions(for: provider)?.count,
             hasToday: store.capacityDockToday(for: provider) != nil,
             tailEdge: model.detailTailEdge,

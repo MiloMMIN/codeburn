@@ -392,7 +392,10 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // it identifies the request, and moving it would leave the cached output-0
   // copy beside the new row - so only this bump re-parses a v2 cache into the
   // corrected shape.
-  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v3',
+  // chatsession-otel-skills-v1: structured Skill calls are now extracted from
+  // VS Code chatSessions and OTel execute_tool spans. Cached calls lack those
+  // fields, so force one re-parse before serving period breakdowns.
+  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v3-chatsession-otel-skills-v1',
   // authoritative-usage-v4: persist one Grok session call from top-level
   // authoritative totals, use modelUsage only for priced attribution, clamp
   // reasoning per record, and label mixed sessions estimated.
@@ -438,7 +441,13 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   pi: 'cwd-project-path-v1-project-group-by-abs-v1',
   // project-group-by-abs-v1: shared Pi/OMP serve grouping uses abs identity.
   omp: 'nested-agent-v1-reported-cost-v2-cwd-project-path-v1-project-group-by-abs-v1',
-  opencode: 'session-model-v1',
+  // archived-subtree-v1 (#1362): the subtree walk no longer filters
+  // `time_archived IS NULL`. An archived ROOT self-heals — it was evicted as an
+  // undiscovered non-durable source and comes back new — but a root whose CHILD
+  // was archived stays a present, unchanged source: every opencode entry
+  // fingerprints the same database file, so a warm cache keeps serving the
+  // parse that dropped the child's calls until the database is written again.
+  opencode: 'session-model-v1-archived-subtree-v1',
   quickdesk: 'emf-sqlite-v2-est-cost',
   // session-lineage-capture-v1: SessionLineage (CB-1, slice 1) is now carried
   // on the cached file for every kimicode wire. Child evidence is the
@@ -449,7 +458,8 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // additive; every cost / token / call total is byte-identical to a build
   // that omits it.
   kimicode: 'wire-usage-v1-est-cost-session-lineage-capture-v1',
-  'kilo-code': 'worktree-project-grouping-v1-session-model-v1',
+  // archived-subtree-v1: KiloCode shares the SQLite parser and the same schema.
+  'kilo-code': 'worktree-project-grouping-v1-session-model-v1-archived-subtree-v1',
   'roo-code': 'worktree-project-grouping-v1',
   warp: 'worktree-project-grouping-v1-est-cost',
   antigravity: 'worktree-project-grouping-v6',

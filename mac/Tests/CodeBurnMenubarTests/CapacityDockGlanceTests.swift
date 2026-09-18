@@ -44,6 +44,7 @@ struct CapacityDockGlanceTests {
         func height(_ connection: QuotaSummary.Connection) -> CGFloat {
             CapacityDockMetrics.detailHeight(
                 quota: quota(windows, connection: connection),
+                provider: .claude,
                 sessionCount: 2,
                 hasToday: true,
                 tailEdge: .right,
@@ -65,6 +66,7 @@ struct CapacityDockGlanceTests {
         for scale in [0.9, 1.0, 1.25] {
             let h = CapacityDockMetrics.detailHeight(
                 quota: quota(windows, connection: .stale),
+                provider: .claude,
                 sessionCount: 2,
                 hasToday: true,
                 tailEdge: .right,
@@ -228,6 +230,7 @@ struct CapacityDockGlanceTests {
         func height(_ count: Int?, hasToday: Bool, windows: [QuotaSummary.Window]) -> CGFloat {
             CapacityDockMetrics.detailHeight(
                 quota: quota(windows),
+                provider: .claude,
                 sessionCount: count,
                 hasToday: hasToday,
                 tailEdge: .right,
@@ -283,6 +286,7 @@ struct CapacityDockGlanceTests {
         func height(_ tailEdge: CapacityDockEdge) -> CGFloat {
             CapacityDockMetrics.detailHeight(
                 quota: quota([window("5-hour", 0.2)]),
+                provider: .claude,
                 sessionCount: 2,
                 hasToday: true,
                 tailEdge: tailEdge,
@@ -304,6 +308,7 @@ struct CapacityDockGlanceTests {
                     window("Weekly · Opus", 0.7),
                     window("Weekly · Sonnet", 0.9),
                 ]),
+                provider: .claude,
                 sessionCount: 4,
                 hasToday: true,
                 tailEdge: .bottom,
@@ -368,5 +373,29 @@ struct CapacityDockGlanceTests {
         #expect(block.sessions.count == 2)
         #expect(block.sessions.filter { $0.provider == "claude" }.count == 1)
         #expect(block.sessions[1].contextFraction == nil)
+    }
+
+    /// Pins the line box the measured blocks are built on. SwiftUI draws a line
+    /// of `.system(size:)` a point taller than either AppKit metric at 10 and
+    /// 11pt (13 and 14, not 12 and 13), and a reserve built on the shorter
+    /// number clips the last line of every wrapped block.
+    @Test("Measured blocks use SwiftUI's line box, not the font's own extent")
+    func measuredBlocksMatchSwiftUILineBoxes() {
+        let width: CGFloat = 350 - 2 * CapacityDockGlance.contentInset
+        func block(_ connection: QuotaSummary.Connection) -> CGFloat {
+            CapacityDockGlance.connectionBlockHeight(connection, provider: .claude, width: width)
+        }
+        // 6 top + an 11pt line (14) + 8 bottom.
+        #expect(block(.disconnected) == 28)
+        // The same, plus 3 + a one-line 10pt instruction (13).
+        #expect(block(.terminalFailure(reason: nil)) == 44)
+        // And again plus 3 + a one-line 10pt reason (13).
+        #expect(block(.terminalFailure(reason: "Token expired")) == 60)
+        // 16 inset + a 20 title row + 11 + a one-line 12pt paragraph (15) + the
+        // action row.
+        #expect(
+            CapacityDockGlance.connectCardHeight(provider: .claude, width: width)
+                == 47 + 15 + CapacityDockGlance.actionRowHeight
+        )
     }
 }
